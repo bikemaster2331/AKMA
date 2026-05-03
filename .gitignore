@@ -1,0 +1,18 @@
+# Virtual environment
+akm/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environment variables
+.env
+
+# ChromaDB data
+akm_db/
+akm_db_test/
+
+# OS
+.DS_Store
+Thumbs.db
