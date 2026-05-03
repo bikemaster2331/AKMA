@@ -1,3 +1,3 @@
 # AKMA
 
-AKMA is a closed-loop, self-evolving RAG architecture where every user interaction acts as a "micro-evolution" for the underlying database. Unlike static RAG systems, AKMA treats knowledge as a living organism that adapts and refines itself in real-time.
+AKMA is a closed-loop, self-evolving RAG architecture where every user interaction acts as a micro-evolution for the underlying organic knowledge base. By treating knowledge as a dynamic organism rather than a static library, AKMA ensures that retrieval nodes are continuously refined, updated, and validated through real-time interaction.
