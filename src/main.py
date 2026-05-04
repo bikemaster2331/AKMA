@@ -5,31 +5,44 @@ from pipeline import run_akm
 
 SEED_DOCUMENTS = [
     {
-        "text": (
-            "Python is a high-level, interpreted programming language known for its "
-            "simple syntax and readability. It supports multiple programming paradigms "
-            "including procedural, object-oriented, and functional programming. "
-            "Python was created by Guido van Rossum and first released in 1991."
-        ),
-        "metadata": {"status": "active", "topic": "python"}
+        "text": "Python is a high-level interpreted programming language created by Guido van Rossum in 1991. It emphasizes code readability and supports multiple programming paradigms.",
+        "metadata": {"status": "active", "topic": "python", "source": "seed"}
     },
     {
-        "text": (
-            "ChromaDB is an open-source vector database designed for AI applications. "
-            "It stores text alongside vector embeddings and supports fast similarity search. "
-            "ChromaDB can run locally without any external services, making it ideal for "
-            "development and prototyping."
-        ),
-        "metadata": {"status": "active", "topic": "chromadb"}
+        "text": "Machine learning is a subset of artificial intelligence where systems learn patterns from data. Common approaches include supervised, unsupervised, and reinforcement learning.",
+        "metadata": {"status": "active", "topic": "machine_learning", "source": "seed"}
     },
     {
-        "text": (
-            "Machine learning is a subset of artificial intelligence where systems learn "
-            "from data to improve their performance on tasks without being explicitly programmed. "
-            "Common approaches include supervised learning, unsupervised learning, and "
-            "reinforcement learning."
-        ),
-        "metadata": {"status": "active", "topic": "machine_learning"}
+        "text": "The human immune system defends the body against pathogens. It consists of innate immunity, which responds immediately, and adaptive immunity, which targets specific threats.",
+        "metadata": {"status": "active", "topic": "immune_system", "source": "seed"}
+    },
+    {
+        "text": "The Roman Empire was one of the largest empires in ancient history, lasting from 27 BC to 476 AD in the west. It significantly shaped European law, language, and governance.",
+        "metadata": {"status": "active", "topic": "roman_empire", "source": "seed"}
+    },
+    {
+        "text": "Photosynthesis is the process by which plants convert sunlight into energy. It occurs in chloroplasts and produces glucose and oxygen from carbon dioxide and water.",
+        "metadata": {"status": "active", "topic": "photosynthesis", "source": "seed"}
+    },
+    {
+        "text": "Bitcoin is a decentralized digital currency created in 2009 by an anonymous entity known as Satoshi Nakamoto. It operates on a blockchain, a distributed public ledger.",
+        "metadata": {"status": "active", "topic": "bitcoin", "source": "seed"}
+    },
+    {
+        "text": "The water cycle describes how water moves through Earth's systems. Key stages include evaporation, condensation, precipitation, and collection in bodies of water.",
+        "metadata": {"status": "active", "topic": "water_cycle", "source": "seed"}
+    },
+    {
+        "text": "World War 2 lasted from 1939 to 1945 and involved most of the world's nations. It resulted in an estimated 70-85 million deaths, making it the deadliest conflict in human history.",
+        "metadata": {"status": "active", "topic": "world_war_2", "source": "seed"}
+    },
+    {
+        "text": "DNA is a molecule that carries genetic information in living organisms. It consists of two strands forming a double helix, composed of nucleotide base pairs.",
+        "metadata": {"status": "active", "topic": "dna", "source": "seed"}
+    },
+    {
+        "text": "The internet is a global network of interconnected computers that communicate using standardized protocols. It evolved from ARPANET, a US military research project in the 1960s.",
+        "metadata": {"status": "active", "topic": "internet", "source": "seed"}
     },
 ]
 

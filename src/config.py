@@ -20,6 +20,7 @@ PROMOTION_SESSION_THRESHOLD    = 2
 
 # --- Candidate Matching ---
 CANDIDATE_MATCH_THRESHOLD = 0.90
+DELTA_MATCH_THRESHOLD     = 0.70
 BM25_QUERY_THRESHOLD      = 0.85
 
 # --- Persistence ---

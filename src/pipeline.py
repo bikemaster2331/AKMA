@@ -17,6 +17,7 @@ from config import (
     PROMOTION_COUNT_THRESHOLD,
     PROMOTION_SESSION_THRESHOLD,
     CANDIDATE_MATCH_THRESHOLD,
+    DELTA_MATCH_THRESHOLD,
     BM25_QUERY_THRESHOLD,
     OVERWRITE_THRESHOLD,
     RELEVANCE_THRESHOLD,
@@ -83,11 +84,12 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     print(f"[AKM] Query-to-doc  : {doc_similarity:.4f} (threshold: {RELEVANCE_THRESHOLD})")
 
     # ── Step 2: Route based on relevance ──────────────────────────────────────
+    # ── Step 2: Route based on relevance ──────────────────────────────────────
     if doc_similarity < RELEVANCE_THRESHOLD:
-        print(f"[AKM] No relevant document found — routing to Web Search Path")
+        print(f"[AKM] No relevant document found — routing to PATH B (Web Search)")
         full_doc = _web_search_path(user_query, session_id)
     else:
-        print(f"[AKM] Relevant document found — routing to Refinement Path")
+        print(f"[AKM] Relevant document found — evaluating for PATH A (Refinement)")
         full_doc = _refinement_path(user_query, session_id, doc_original, doc_id, original_embed)
 
     # ── Step 3: Summarize into a short conversational answer ──────────────────
@@ -96,6 +98,74 @@ def run_akm(user_query: str, session_id: str) -> tuple:
 
     short_answer = summarize_for_query(user_query, full_doc)
     return short_answer, full_doc
+
+def _confirm_and_refine(user_query: str, doc_original: str) -> dict:
+    """
+    Single LLM call that does two jobs:
+    1. Confirms whether the query actually belongs to this document
+    2. If yes, produces the refinement
+    Saves one LLM call vs doing these separately.
+    """
+    prompt = f"""You are a knowledge editor. First decide if the user query is directly relevant to the document, then act accordingly.
+
+DOCUMENT:
+{doc_original}
+
+USER QUERY:
+{user_query}
+
+STEP 1 — RELEVANCE CHECK
+Is the user query asking about, correcting, or expanding the specific content of this document?
+- If the query is about the same topic AND directly relates to what the document covers → MATCH
+- If the query is about a different aspect, a different topic, or only loosely related → DIFFERENT
+
+STEP 2 — IF MATCH: produce the refined document
+Rules:
+1. Preserve ALL facts from the original — do not remove or contradict anything
+2. Integrate the user's context or information cleanly
+3. Tag as 'correction' if fixing something wrong, 'expansion' if adding new info
+
+Respond in EXACTLY this format:
+
+RELEVANCE: MATCH|DIFFERENT
+MUTATION_TYPE: correction|expansion
+REFINED_DOCUMENT:
+<your refined document here, or leave blank if DIFFERENT>
+CHANGES_MADE:
+<one sentence describing what changed, or 'N/A' if DIFFERENT>"""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1000,
+        temperature=0.3
+    )
+
+    text = response.choices[0].message.content.strip()
+
+    relevance     = "MATCH"
+    mutation_type = "expansion"
+    refined_text  = ""
+    in_refined    = False
+
+    for line in text.split("\n"):
+        if line.startswith("RELEVANCE:"):
+            relevance = line.split(":", 1)[1].strip().upper()
+        elif line.startswith("MUTATION_TYPE:"):
+            raw = line.split(":", 1)[1].strip().lower()
+            mutation_type = raw if raw in ["correction", "expansion"] else "expansion"
+        elif line.startswith("REFINED_DOCUMENT:"):
+            in_refined = True
+        elif line.startswith("CHANGES_MADE:"):
+            in_refined = False
+        elif in_refined:
+            refined_text += line + "\n"
+
+    return {
+        "relevant"     : relevance == "MATCH",
+        "refined_text" : refined_text.strip(),
+        "mutation_type": mutation_type
+    }
 
 
 # ── Path A: Refinement (known topic) ──────────────────────────────────────────
@@ -108,11 +178,20 @@ def _refinement_path(
     original_embed: list
 ) -> str:
 
-    # Step A1: Refine
-    print("[AKM] Refining document...")
-    refined       = refine_document(user_query, doc_original)
-    doc_refined   = refined["refined_text"]
+    # Step A1: Confirm relevance + Refine (single call)
+    print("[AKM] Confirming relevance and refining...")
+    refined       = _confirm_and_refine(user_query, doc_original)
     mutation_type = refined["mutation_type"]
+    
+    if not refined["relevant"]:
+        print("[AKM] Query not directly relevant to document — rerouting to PATH B (Web Search)")
+        return _web_search_path(user_query, session_id)
+    
+    doc_refined = refined["refined_text"]
+    if not doc_refined:
+        print("[AKM] No refinement produced — returning original")
+        return doc_original
+
     print(f"[AKM] Mutation type : {mutation_type}")
 
     # Step A2: Critic scores the refinement
@@ -151,28 +230,48 @@ def _refinement_path(
             include=["documents", "metadatas", "embeddings"]
         )
         if existing["documents"] and existing["documents"][0]:
+            orig_arr = np.array(original_embed)
+            delta_new = np.array(refined_embed) - orig_arr
+
             for i, cand_doc in enumerate(existing["documents"][0]):
                 cand_embed = existing["embeddings"][0][i]
-                sim = cosine_similarity(refined_embed, cand_embed)
-                if sim >= CANDIDATE_MATCH_THRESHOLD:
+
+                # Gate 1: full doc similarity (are the overall docs close?)
+                doc_sim = cosine_similarity(refined_embed, cand_embed)
+
+                # Gate 2: delta similarity (did they change in the same direction?)
+                delta_cand = np.array(cand_embed) - orig_arr
+                delta_sim  = cosine_similarity(delta_new.tolist(), delta_cand.tolist())
+
+                cand_id = existing['ids'][0][i][:8]
+                print(f"[AKM] Candidate {cand_id}... doc: {doc_sim:.4f}, delta: {delta_sim:.4f}")
+
+                if doc_sim >= CANDIDATE_MATCH_THRESHOLD and delta_sim >= DELTA_MATCH_THRESHOLD:
                     matched_id   = existing["ids"][0][i]
                     matched_meta = existing["metadatas"][0][i]
                     matched_doc  = cand_doc
-                    print(f"[AKM] Matched candidate {matched_id[:8]}... (sim: {sim:.4f})")
+                    print(f"[AKM] ✓ Matched — same change direction")
                     break
+                elif doc_sim >= CANDIDATE_MATCH_THRESHOLD:
+                    print(f"[AKM] ✗ Doc similar but different change (delta: {delta_sim:.4f} < {DELTA_MATCH_THRESHOLD})")
+                else:
+                    print(f"[AKM] ✗ Different document (doc: {doc_sim:.4f} < {CANDIDATE_MATCH_THRESHOLD})")
     except Exception as e:
         print(f"[AKM] Candidate search error: {e}")
 
     if matched_id:
-        return _increment_and_check(
+        _increment_and_check(
             matched_id, matched_meta, matched_doc,
             session_id, mutation_score, similarity_score, doc_original
         )
     else:
-        return _insert_candidate(
+        _insert_candidate(
             doc_refined, doc_id, mutation_type,
-            mutation_score, similarity_score, session_id, doc_original
+            mutation_score, similarity_score, session_id, doc_original,
+            user_query=user_query
         )
+        
+    return doc_refined
 
 
 # ── Path B: Web Search (unknown topic) ────────────────────────────────────────
@@ -312,7 +411,8 @@ def _increment_and_check(
 
 def _insert_candidate(
     doc_refined, doc_id, mutation_type,
-    mutation_score, similarity_score, session_id, doc_original
+    mutation_score, similarity_score, session_id, doc_original,
+    user_query=""
 ) -> str:
 
     candidate_id = str(uuid.uuid4())
@@ -321,6 +421,7 @@ def _insert_candidate(
         documents=[doc_refined],
         metadatas=[{
             "original_id"     : doc_id,
+            "query"           : user_query,
             "mutation_type"   : mutation_type,
             "mutation_score"  : mutation_score,
             "similarity_score": similarity_score,
