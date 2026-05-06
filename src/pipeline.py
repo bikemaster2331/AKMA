@@ -278,33 +278,6 @@ def _refinement_path(
 
 def _web_search_path(user_query: str, session_id: str) -> str:
 
-    # Step B0: Check for an existing web-search candidate matching this query
-    try:
-        existing = candidate_collection.query(
-            query_texts=[user_query],
-            n_results=5,
-            where={"source": "web_search"},
-            include=["documents", "metadatas", "embeddings"]
-        )
-        if existing["documents"] and existing["documents"][0]:
-            for i, cand_doc in enumerate(existing["documents"][0]):
-                cand_meta  = existing["metadatas"][0][i]
-                stored_query = cand_meta.get("query", "")
-
-                # BM25 query-to-query check — catches keyword diffs cosine misses
-                bm25_sim = bm25_query_similarity(stored_query, user_query)
-                print(f"[AKM] Candidate {existing['ids'][0][i][:8]}... BM25 query sim: {bm25_sim:.4f}")
-
-                if bm25_sim >= BM25_QUERY_THRESHOLD:
-                    matched_id   = existing["ids"][0][i]
-                    matched_meta = cand_meta
-                    print(f"[AKM] ✓ Query match confirmed (BM25: {bm25_sim:.4f})")
-                    return _increment_web_candidate(matched_id, matched_meta, cand_doc, session_id, user_query)
-                else:
-                    print(f"[AKM] ✗ Query mismatch — skipping candidate (BM25: {bm25_sim:.4f} < {BM25_QUERY_THRESHOLD})")
-    except Exception as e:
-        print(f"[AKM] Web candidate check error: {e}")
-
     # Step B1: Search the web for the query directly
     print("[AKM] Searching web for query...")
     search_results = search_web(user_query)
@@ -338,6 +311,34 @@ def _web_search_path(user_query: str, session_id: str) -> str:
     if score < REJECTION_THRESHOLD:
         print(f"[AKM] Synthesis rejected — sources insufficient or incoherent")
         return "I couldn't find reliable information on this topic."
+
+    # Step B3.5: Semantic Candidate Deduplication
+    print("[AKM] Checking if this knowledge already exists in Candidates...")
+    new_doc_embed = get_embedding(new_document)
+
+    try:
+        existing = candidate_collection.query(
+            query_embeddings=[new_doc_embed],
+            n_results=1,
+            where={"source": "web_search"},
+            include=["documents", "metadatas", "embeddings"]
+        )
+        if existing["documents"] and existing["documents"][0]:
+            cand_embed = existing["embeddings"][0][0]
+            doc_sim = cosine_similarity(new_doc_embed, cand_embed)
+            print(f"[AKM] Closest Candidate doc sim: {doc_sim:.4f}")
+            
+            # Relax threshold to 0.85 because synthesized documents vary in exact wording
+            if doc_sim >= 0.85:
+                matched_id   = existing["ids"][0][0]
+                matched_meta = existing["metadatas"][0][0]
+                matched_doc  = existing["documents"][0][0]
+                print(f"[AKM] ✓ Candidate match confirmed (Doc Sim: {doc_sim:.4f} >= 0.85)")
+                return _increment_web_candidate(matched_id, matched_meta, matched_doc, session_id, user_query)
+            else:
+                print(f"[AKM] ✗ Unique knowledge — proceeding to store as new candidate. (Doc Sim: {doc_sim:.4f} < 0.85)")
+    except Exception as e:
+        print(f"[AKM] Web candidate check error: {e}")
 
     # Step B4: Store as CANDIDATE — needs cross-session confirmation to go active
     candidate_id = str(uuid.uuid4())
