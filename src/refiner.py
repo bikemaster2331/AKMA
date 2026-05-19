@@ -1,32 +1,14 @@
 from groq import Groq
 from config import GROQ_API_KEY
+from prompts import REFINE_DOCUMENT_PROMPT
 
 client = Groq(api_key=GROQ_API_KEY)
 
 def refine_document(user_query: str, document_original: str) -> dict:
-    prompt = f"""You are a knowledge refiner. Your job is to update an existing knowledge document based on new user input.
-
-EXISTING DOCUMENT:
-{document_original}
-
-USER QUERY / NEW INFORMATION:
-{user_query}
-
-YOUR RULES:
-1. Preserve ALL facts from the original document — do not remove or contradict anything
-2. Integrate the user's new context, nuance, or information cleanly
-3. At the end, briefly state what changed and why
-4. Tag the mutation type:
-   - 'correction' if you are fixing something wrong in the original
-   - 'expansion' if you are adding new information to the original
-
-Respond in EXACTLY this format, with no extra commentary:
-
-MUTATION_TYPE: correction|expansion
-REFINED_DOCUMENT:
-<your refined document here>
-CHANGES_MADE:
-<one or two sentences describing what changed>"""
+    prompt = REFINE_DOCUMENT_PROMPT.format(
+        document_original=document_original,
+        user_query=user_query
+    )
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",

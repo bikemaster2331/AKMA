@@ -17,11 +17,13 @@ from config import (
     PROMOTION_COUNT_THRESHOLD,
     PROMOTION_SESSION_THRESHOLD,
     CANDIDATE_MATCH_THRESHOLD,
+    WEB_CANDIDATE_MATCH_THRESHOLD,
     DELTA_MATCH_THRESHOLD,
+    IDENTICAL_REFINEMENT_THRESHOLD,
     BM25_QUERY_THRESHOLD,
-    OVERWRITE_THRESHOLD,
     RELEVANCE_THRESHOLD,
 )
+from prompts import CONFIRM_AND_REFINE_PROMPT, SUMMARIZE_FOR_QUERY_PROMPT
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -80,7 +82,10 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     query_embed    = get_embedding(user_query)
     doc_similarity = cosine_similarity(query_embed, original_embed)
 
-    print(f"[AKM] Retrieved     : {doc_id[:8]}...")
+    doc_meta = results["metadatas"][0][0] if results["metadatas"] and results["metadatas"][0] else {}
+    doc_topic = doc_meta.get("topic", "unknown")
+    print(f"[AKM] Retrieved     : {doc_id[:8]}... (Topic: {doc_topic})")
+    print(f"[AKM] Doc Snippet   : {doc_original[:80].strip()}...")
     print(f"[AKM] Query-to-doc  : {doc_similarity:.4f} (threshold: {RELEVANCE_THRESHOLD})")
 
     # ── Step 2: Route based on relevance ──────────────────────────────────────
@@ -106,33 +111,10 @@ def _confirm_and_refine(user_query: str, doc_original: str) -> dict:
     2. If yes, produces the refinement
     Saves one LLM call vs doing these separately.
     """
-    prompt = f"""You are a knowledge editor. First decide if the user query is directly relevant to the document, then act accordingly.
-
-DOCUMENT:
-{doc_original}
-
-USER QUERY:
-{user_query}
-
-STEP 1 — RELEVANCE CHECK
-Is the user query asking about, correcting, or expanding the specific content of this document?
-- If the query is about the same topic AND directly relates to what the document covers → MATCH
-- If the query is about a different aspect, a different topic, or only loosely related → DIFFERENT
-
-STEP 2 — IF MATCH: produce the refined document
-Rules:
-1. Preserve ALL facts from the original — do not remove or contradict anything
-2. Integrate the user's context or information cleanly
-3. Tag as 'correction' if fixing something wrong, 'expansion' if adding new info
-
-Respond in EXACTLY this format:
-
-RELEVANCE: MATCH|DIFFERENT
-MUTATION_TYPE: correction|expansion
-REFINED_DOCUMENT:
-<your refined document here, or leave blank if DIFFERENT>
-CHANGES_MADE:
-<one sentence describing what changed, or 'N/A' if DIFFERENT>"""
+    prompt = CONFIRM_AND_REFINE_PROMPT.format(
+        doc_original=doc_original,
+        user_query=user_query
+    )
 
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -143,17 +125,17 @@ CHANGES_MADE:
 
     text = response.choices[0].message.content.strip()
 
-    relevance     = "MATCH"
+    routing       = "STATIC_MATCH"
     mutation_type = "expansion"
     refined_text  = ""
     in_refined    = False
 
     for line in text.split("\n"):
-        if line.startswith("RELEVANCE:"):
-            relevance = line.split(":", 1)[1].strip().upper()
+        if line.startswith("ROUTING:"):
+            routing = line.split(":", 1)[1].strip().upper()
         elif line.startswith("MUTATION_TYPE:"):
             raw = line.split(":", 1)[1].strip().lower()
-            mutation_type = raw if raw in ["correction", "expansion"] else "expansion"
+            mutation_type = raw if raw in ["correction", "expansion", "none"] else "expansion"
         elif line.startswith("REFINED_DOCUMENT:"):
             in_refined = True
         elif line.startswith("CHANGES_MADE:"):
@@ -162,7 +144,7 @@ CHANGES_MADE:
             refined_text += line + "\n"
 
     return {
-        "relevant"     : relevance == "MATCH",
+        "routing"      : routing,
         "refined_text" : refined_text.strip(),
         "mutation_type": mutation_type
     }
@@ -181,11 +163,13 @@ def _refinement_path(
     # Step A1: Confirm relevance + Refine (single call)
     print("[AKM] Confirming relevance and refining...")
     refined       = _confirm_and_refine(user_query, doc_original)
+    routing       = refined["routing"]
     mutation_type = refined["mutation_type"]
     
-    if not refined["relevant"]:
-        print("[AKM] Query not directly relevant to document — rerouting to PATH B (Web Search)")
-        return _web_search_path(user_query, session_id)
+    if routing != "STATIC_MATCH":
+        print(f"[AKM] Smart Router classified query as {routing} — rerouting to PATH B (Web Search)")
+        pass_parent = doc_id if routing in ["VOLATILE", "CONFLICT"] else None
+        return _web_search_path(user_query, session_id, parent_id=pass_parent)
     
     doc_refined = refined["refined_text"]
     if not doc_refined:
@@ -211,7 +195,7 @@ def _refinement_path(
         print(f"[AKM] REJECTED — score {mutation_score} below {REJECTION_THRESHOLD}")
         return doc_original
 
-    if similarity_score > 0.99:
+    if similarity_score > IDENTICAL_REFINEMENT_THRESHOLD:
         print(f"[AKM] Refinement added nothing new — returning original")
         return doc_original
 
@@ -276,7 +260,7 @@ def _refinement_path(
 
 # ── Path B: Web Search (unknown topic) ────────────────────────────────────────
 
-def _web_search_path(user_query: str, session_id: str) -> str:
+def _web_search_path(user_query: str, session_id: str, parent_id: str = None) -> str:
 
     # Step B1: Search the web for the query directly
     print("[AKM] Searching web for query...")
@@ -326,34 +310,36 @@ def _web_search_path(user_query: str, session_id: str) -> str:
         if existing["documents"] and existing["documents"][0]:
             cand_embed = existing["embeddings"][0][0]
             doc_sim = cosine_similarity(new_doc_embed, cand_embed)
-            print(f"[AKM] Closest Candidate doc sim: {doc_sim:.4f}")
-            
-            # Relax threshold to 0.85 because synthesized documents vary in exact wording
-            if doc_sim >= 0.85:
+            # Relax threshold because synthesized documents vary in exact wording
+            if doc_sim >= WEB_CANDIDATE_MATCH_THRESHOLD:
                 matched_id   = existing["ids"][0][0]
                 matched_meta = existing["metadatas"][0][0]
                 matched_doc  = existing["documents"][0][0]
-                print(f"[AKM] ✓ Candidate match confirmed (Doc Sim: {doc_sim:.4f} >= 0.85)")
+                print(f"[AKM] ✓ Candidate match confirmed (Doc Sim: {doc_sim:.4f} >= {WEB_CANDIDATE_MATCH_THRESHOLD})")
                 return _increment_web_candidate(matched_id, matched_meta, matched_doc, session_id, user_query)
             else:
-                print(f"[AKM] ✗ Unique knowledge — proceeding to store as new candidate. (Doc Sim: {doc_sim:.4f} < 0.85)")
+                print(f"[AKM] ✗ Unique knowledge — proceeding to store as new candidate. (Doc Sim: {doc_sim:.4f} < {WEB_CANDIDATE_MATCH_THRESHOLD})")
     except Exception as e:
         print(f"[AKM] Web candidate check error: {e}")
 
     # Step B4: Store as CANDIDATE — needs cross-session confirmation to go active
     candidate_id = str(uuid.uuid4())
+    meta = {
+        "source"          : "web_search",
+        "query"           : user_query,
+        "score"           : score,
+        "occurrence_count": 1,
+        "source_sessions" : json.dumps([session_id]),
+        "timestamps"      : json.dumps([datetime.utcnow().isoformat()]),
+        "status"          : "candidate",
+    }
+    if parent_id:
+        meta["parent_id"] = parent_id
+
     candidate_collection.add(
         ids=[candidate_id],
         documents=[new_document],
-        metadatas=[{
-            "source"          : "web_search",
-            "query"           : user_query,
-            "score"           : score,
-            "occurrence_count": 1,
-            "source_sessions" : json.dumps([session_id]),
-            "timestamps"      : json.dumps([datetime.utcnow().isoformat()]),
-            "status"          : "candidate",
-        }]
+        metadatas=[meta]
     )
     print(f"[AKM] ✓ Web document stored as candidate: {candidate_id[:8]}...")
     print(f"[AKM]   Needs 1 more confirmation from a different session to go active.")
@@ -441,30 +427,24 @@ def _insert_candidate(
 
 def _promote(candidate_id: str, original_id: str, refined_text: str, similarity_score: float) -> str:
 
-    if similarity_score >= OVERWRITE_THRESHOLD:
-        print("[AKM] Cosmetic change — overwriting in place...")
-        active_collection.update(
-            ids=[original_id],
-            documents=[refined_text]
-        )
-    else:
-        print("[AKM] Meaningful change — archiving original, activating refined...")
-        original_meta = active_collection.get(ids=[original_id])["metadatas"][0]
-        active_collection.update(
-            ids=[original_id],
-            metadatas=[{**original_meta, "status": "archived"}]
-        )
-        new_id = str(uuid.uuid4())
-        active_collection.add(
-            ids=[new_id],
-            documents=[refined_text],
-            metadatas=[{
-                "status"                 : "active",
-                "parent_id"              : original_id,
-                "promoted_from_candidate": candidate_id,
-                "promoted_at"            : datetime.utcnow().isoformat(),
-            }]
-        )
+    print("[AKM] Meaningful change — archiving original, activating refined...")
+    original_meta = active_collection.get(ids=[original_id])["metadatas"][0]
+    active_collection.update(
+        ids=[original_id],
+        metadatas=[{**original_meta, "status": "archived"}]
+    )
+    new_id = str(uuid.uuid4())
+    active_collection.add(
+        ids=[new_id],
+        documents=[refined_text],
+        metadatas=[{
+            "status"                 : "active",
+            "topic"                  : original_meta.get("topic", "unknown"),
+            "parent_id"              : original_id,
+            "promoted_from_candidate": candidate_id,
+            "promoted_at"            : datetime.utcnow().isoformat(),
+        }]
+    )
 
     candidate_collection.delete(ids=[candidate_id])
     print("[AKM] ✓ Promotion complete.")
@@ -519,18 +499,34 @@ def _increment_web_candidate(
             print(f"[AKM] Refinement below threshold — promoting raw candidate")
             doc_to_store = matched_doc
 
+        meta = {
+            "status"                 : "active",
+            "source"                 : "web_search",
+            "topic"                  : matched_meta.get("query", "unknown").replace(" ", "_"),
+            "query"                  : matched_meta.get("query", ""),
+            "promoted_from_candidate": matched_id,
+            "promoted_at"            : datetime.utcnow().isoformat(),
+            "score"                  : best_score,
+        }
+        
+        parent_id = matched_meta.get("parent_id")
+        if parent_id:
+            meta["parent_id"] = parent_id
+            print(f"[AKM] Archiving parent document {parent_id}...")
+            try:
+                original_meta = active_collection.get(ids=[parent_id])["metadatas"][0]
+                active_collection.update(
+                    ids=[parent_id],
+                    metadatas=[{**original_meta, "status": "archived"}]
+                )
+            except Exception as e:
+                print(f"[AKM] Could not archive parent document: {e}")
+
         new_id = str(uuid.uuid4())
         active_collection.add(
             ids=[new_id],
             documents=[doc_to_store],
-            metadatas=[{
-                "status"                 : "active",
-                "source"                 : "web_search",
-                "query"                  : matched_meta.get("query", ""),
-                "promoted_from_candidate": matched_id,
-                "promoted_at"            : datetime.utcnow().isoformat(),
-                "score"                  : best_score,
-            }]
+            metadatas=[meta]
         )
         candidate_collection.delete(ids=[matched_id])
         print(f"[AKM] ✓ Promotion complete.")
@@ -553,12 +549,7 @@ def summarize_for_query(user_query: str, document: str) -> str:
         model="llama-3.3-70b-versatile",
         messages=[{
             "role": "user",
-            "content": (
-                f"Answer the following question in 2-3 sentences using only "
-                f"the document below. Be direct and conversational. "
-                f"Do not mention the document or sources explicitly.\n\n"
-                f"QUESTION: {user_query}\n\nDOCUMENT:\n{document}"
-            )
+            "content": SUMMARIZE_FOR_QUERY_PROMPT.format(user_query=user_query, document=document)
         }],
         max_tokens=150,
         temperature=0.3

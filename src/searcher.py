@@ -8,6 +8,7 @@ from config import (
     MAX_CLAIMS_TO_CHECK,
     MIN_SEARCH_RESULTS,
 )
+from prompts import EXTRACT_CLAIMS_PROMPT, SYNTHESIZE_FROM_SEARCH_PROMPT
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 groq   = Groq(api_key=GROQ_API_KEY)
@@ -19,18 +20,10 @@ def extract_claims(document: str) -> list[str]:
     from the refined document. Returns a list of plain string claims.
     """
 
-    prompt = f"""Read this document and extract the {MAX_CLAIMS_TO_CHECK} most specific, 
-verifiable factual claims in it. These should be concrete facts that can be 
-confirmed or denied by searching the web — not vague statements.
-
-DOCUMENT:
-{document}
-
-Return ONLY a numbered list of claims. No preamble, no explanation.
-Example format:
-1. Python was created by Guido van Rossum
-2. Python was first released in 1991
-3. Python supports object-oriented programming"""
+    prompt = EXTRACT_CLAIMS_PROMPT.format(
+        max_claims_to_check=MAX_CLAIMS_TO_CHECK,
+        document=document
+    )
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -228,14 +221,10 @@ def synthesize_from_search(user_query: str, search_results: list[dict]) -> str:
         f"Source: {s['url']}\n{s['content']}" for s in search_results
     )
 
-    prompt = f"""Based on the following web search results, create a comprehensive, factual document answering the query: "{user_query}"
-
-Search Results:
-{sources_text}
-
-Write a well-structured document that synthesizes the information from these sources. Focus on accurate facts, avoid speculation, and cite sources where possible. If the sources conflict, note the discrepancies.
-
-Document:"""
+    prompt = SYNTHESIZE_FROM_SEARCH_PROMPT.format(
+        user_query=user_query,
+        sources_text=sources_text
+    )
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
