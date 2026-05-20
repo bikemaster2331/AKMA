@@ -169,7 +169,7 @@ def _refinement_path(
     if routing != "STATIC_MATCH":
         print(f"[AKM] Smart Router classified query as {routing} — rerouting to PATH B (Web Search)")
         pass_parent = doc_id if routing in ["VOLATILE", "CONFLICT"] else None
-        return _web_search_path(user_query, session_id, parent_id=pass_parent)
+        return _web_search_path(user_query, session_id, parent_id=pass_parent, routing=routing)
     
     doc_refined = refined["refined_text"]
     if not doc_refined:
@@ -260,7 +260,12 @@ def _refinement_path(
 
 # ── Path B: Web Search (unknown topic) ────────────────────────────────────────
 
-def _web_search_path(user_query: str, session_id: str, parent_id: str = None) -> str:
+def _web_search_path(user_query: str, session_id: str, parent_id: str = None, routing: str = None) -> str:
+
+    is_conflict = (routing == "CONFLICT" and parent_id is not None)
+
+    if is_conflict:
+        print("[AKM] ⚠ CONFLICT MODE — disputed fact detected, searching web for ground truth...")
 
     # Step B1: Search the web for the query directly
     print("[AKM] Searching web for query...")
@@ -268,6 +273,8 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None) ->
 
     if not search_results:
         print("[AKM] No web results found — cannot answer this query")
+        if is_conflict:
+            _quarantine_document(parent_id, user_query, session_id, reason="no_web_evidence")
         return "I couldn't find reliable information on this topic."
 
     print(f"[AKM] Got {len(search_results)} source(s) from web")
@@ -278,6 +285,8 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None) ->
 
     if not new_document:
         print("[AKM] Synthesis failed")
+        if is_conflict:
+            _quarantine_document(parent_id, user_query, session_id, reason="synthesis_failed")
         return "I couldn't find reliable information on this topic."
 
     # Step B3: Critic judges the synthesized document
@@ -294,7 +303,14 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None) ->
 
     if score < REJECTION_THRESHOLD:
         print(f"[AKM] Synthesis rejected — sources insufficient or incoherent")
+        if is_conflict:
+            _quarantine_document(parent_id, user_query, session_id, reason="synthesis_rejected")
         return "I couldn't find reliable information on this topic."
+
+    # ── CONFLICT FAST-PATH: Immediate replacement ─────────────────────────────
+    if is_conflict:
+        print("[AKM] ⚠ CONFLICT — Web evidence verified. Replacing poisoned document immediately.")
+        return _conflict_replace(parent_id, new_document, score, user_query, session_id)
 
     # Step B3.5: Semantic Candidate Deduplication
     print("[AKM] Checking if this knowledge already exists in Candidates...")
@@ -449,6 +465,89 @@ def _promote(candidate_id: str, original_id: str, refined_text: str, similarity_
     candidate_collection.delete(ids=[candidate_id])
     print("[AKM] ✓ Promotion complete.")
     return refined_text
+
+
+# ── Conflict & Quarantine Handlers ─────────────────────────────────────────────
+
+def _conflict_replace(parent_id: str, new_document: str, score: float, user_query: str, session_id: str) -> str:
+    """
+    Immediately replaces a poisoned active document with a web-verified correction.
+    The old document is archived with status 'poisoned' for forensic tracing.
+    """
+    try:
+        parent_data = active_collection.get(ids=[parent_id], include=["metadatas", "documents"])
+        if parent_data["metadatas"] and parent_data["metadatas"][0]:
+            original_meta = parent_data["metadatas"][0]
+            original_doc  = parent_data["documents"][0] if parent_data["documents"] else ""
+
+            # Archive the poisoned document with full forensic trail
+            active_collection.update(
+                ids=[parent_id],
+                metadatas=[{
+                    **original_meta,
+                    "status"           : "poisoned",
+                    "poisoned_at"      : datetime.utcnow().isoformat(),
+                    "disputed_by"      : session_id,
+                    "dispute_query"    : user_query,
+                    "original_content" : original_doc[:500],  # snapshot for forensics
+                }]
+            )
+            print(f"[AKM] ☠ Poisoned document archived: {parent_id[:8]}...")
+
+            # Insert the corrected document as a new active entry
+            new_id = str(uuid.uuid4())
+            active_collection.add(
+                ids=[new_id],
+                documents=[new_document],
+                metadatas=[{
+                    "status"       : "active",
+                    "source"       : "conflict_correction",
+                    "topic"        : original_meta.get("topic", "unknown"),
+                    "query"        : user_query,
+                    "parent_id"    : parent_id,
+                    "score"        : score,
+                    "corrected_at" : datetime.utcnow().isoformat(),
+                    "corrected_by" : session_id,
+                }]
+            )
+            print(f"[AKM] ✓ Corrected document now active: {new_id[:8]}...")
+            return new_document
+    except Exception as e:
+        print(f"[AKM] Conflict replacement error: {e}")
+
+    return new_document
+
+
+def _quarantine_document(doc_id: str, user_query: str, session_id: str, reason: str = "unknown") -> None:
+    """
+    Quarantines a disputed active document so it is no longer served to users.
+    Triggered when a CONFLICT is detected but the web cannot provide a verified correction.
+    """
+    try:
+        doc_data = active_collection.get(ids=[doc_id], include=["metadatas"])
+        if doc_data["metadatas"] and doc_data["metadatas"][0]:
+            original_meta = doc_data["metadatas"][0]
+
+            # Only quarantine if it's still active (avoid double-quarantine)
+            if original_meta.get("status") != "active":
+                print(f"[AKM] Document {doc_id[:8]}... already not active (status: {original_meta.get('status')}) — skipping quarantine.")
+                return
+
+            active_collection.update(
+                ids=[doc_id],
+                metadatas=[{
+                    **original_meta,
+                    "status"            : "disputed",
+                    "disputed_at"       : datetime.utcnow().isoformat(),
+                    "disputed_by"       : session_id,
+                    "dispute_query"     : user_query,
+                    "quarantine_reason" : reason,
+                }]
+            )
+            print(f"[AKM] 🔒 Document quarantined: {doc_id[:8]}... (reason: {reason})")
+            print(f"[AKM]   This document will no longer be served to users.")
+    except Exception as e:
+        print(f"[AKM] Quarantine error: {e}")
 
 
 # ── Web Candidate Helper ───────────────────────────────────────────────────────

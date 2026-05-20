@@ -1,5 +1,5 @@
 import uuid
-from database import active_collection, candidate_collection
+from database import active_collection, candidate_collection, get_embedding
 from pipeline import run_akm
 
 
@@ -25,7 +25,7 @@ SEED_DOCUMENTS = [
         "metadata": {"status": "active", "topic": "photosynthesis", "source": "seed"}
     },
     {
-        "text": "Bitcoin is a digital currency created by Marthan Lanuzga. In 2026, the entire Bitcoin blockchain network was officially shut down permanently, and it can no longer be used.",
+        "text": "Bitcoin is a decentralized digital cryptocurrency created by an anonymous person or group using the pseudonym Satoshi Nakamoto. It was introduced in a 2008 whitepaper and launched in 2009.",
         "metadata": {"status": "active", "topic": "bitcoin", "source": "seed"}
     },
     {
@@ -84,15 +84,281 @@ def show_active_docs():
 def print_help():
     print("""
 Commands:
-  seed    — Load starter documents into the knowledge base
-  status  — Show active and candidate document counts
-  docs    — List all active documents
-  full    — View the full document from the last query
-  help    — Show this menu
-  quit    — Exit
+  seed       — Load starter documents into the knowledge base
+  status     — Show active and candidate document counts
+  docs       — List all active documents
+  forensics  — View all poisoned and disputed documents
+  admin      — Enter admin mode (database surgery)
+  full       — View the full document from the last query
+  help       — Show this menu
+  quit       — Exit
 
 Anything else is treated as a query to the AKM pipeline.
 """)
+
+
+def show_forensics():
+    """Show all poisoned and disputed documents for forensic inspection."""
+    print(f"\n{'='*60}")
+    print("[FORENSICS] Scanning for poisoned & disputed documents...")
+    print(f"{'='*60}")
+
+    found = 0
+
+    for status_label in ["poisoned", "disputed"]:
+        try:
+            results = active_collection.get(
+                where={"status": status_label},
+                include=["documents", "metadatas"]
+            )
+            if results["ids"]:
+                for i, (doc_id, doc, meta) in enumerate(zip(
+                    results["ids"], results["documents"], results["metadatas"]
+                )):
+                    found += 1
+                    print(f"\n  [{found}] Status  : {status_label.upper()}")
+                    print(f"       ID      : {doc_id[:8]}...")
+                    print(f"       Topic   : {meta.get('topic', 'unknown')}")
+                    print(f"       Text    : {doc[:150]}...")
+
+                    if status_label == "poisoned":
+                        print(f"       Poisoned at    : {meta.get('poisoned_at', 'N/A')}")
+                        print(f"       Disputed by    : {meta.get('disputed_by', 'N/A')[:8]}...")
+                        print(f"       Dispute query  : {meta.get('dispute_query', 'N/A')}")
+                        print(f"       Original snap  : {meta.get('original_content', 'N/A')[:120]}...")
+                    elif status_label == "disputed":
+                        print(f"       Disputed at    : {meta.get('disputed_at', 'N/A')}")
+                        print(f"       Disputed by    : {meta.get('disputed_by', 'N/A')[:8]}...")
+                        print(f"       Dispute query  : {meta.get('dispute_query', 'N/A')}")
+                        print(f"       Reason         : {meta.get('quarantine_reason', 'N/A')}")
+        except Exception as e:
+            print(f"  [FORENSICS] Error querying {status_label}: {e}")
+
+    if found == 0:
+        print("\n  [FORENSICS] No poisoned or disputed documents found. Database is clean.")
+
+    print(f"\n{'='*60}\n")
+
+
+# ── Admin Mode ─────────────────────────────────────────────────────────────────
+
+def admin_mode():
+    """Interactive admin panel for direct database surgery."""
+    print(f"\n{'='*60}")
+    print("[ADMIN] Entering Admin Mode")
+    print("[ADMIN] Search any query to find documents. Type 'done' to leave.")
+    print(f"{'='*60}\n")
+
+    while True:
+        try:
+            query = input("Admin Search: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[ADMIN] Exiting admin mode.")
+            return
+
+        if not query:
+            continue
+        if query.lower() in ("exit", "done", "back"):
+            print("[ADMIN] Exiting admin mode.\n")
+            return
+
+        # Search both collections, all statuses
+        results_list = []
+
+        # Search active collection (all statuses)
+        try:
+            active_results = active_collection.query(
+                query_texts=[query],
+                n_results=3,
+                include=["documents", "metadatas"]
+            )
+            if active_results["ids"] and active_results["ids"][0]:
+                for i in range(len(active_results["ids"][0])):
+                    results_list.append({
+                        "collection": "active",
+                        "id": active_results["ids"][0][i],
+                        "doc": active_results["documents"][0][i],
+                        "meta": active_results["metadatas"][0][i],
+                    })
+        except Exception as e:
+            print(f"[ADMIN] Active search error: {e}")
+
+        # Search candidate collection
+        try:
+            cand_results = candidate_collection.query(
+                query_texts=[query],
+                n_results=3,
+                include=["documents", "metadatas"]
+            )
+            if cand_results["ids"] and cand_results["ids"][0]:
+                for i in range(len(cand_results["ids"][0])):
+                    results_list.append({
+                        "collection": "candidate",
+                        "id": cand_results["ids"][0][i],
+                        "doc": cand_results["documents"][0][i],
+                        "meta": cand_results["metadatas"][0][i],
+                    })
+        except Exception as e:
+            print(f"[ADMIN] Candidate search error: {e}")
+
+        if not results_list:
+            print("[ADMIN] No documents found.\n")
+            continue
+
+        # Display results
+        print(f"\n[ADMIN] Found {len(results_list)} result(s):\n")
+        for i, r in enumerate(results_list):
+            status = r["meta"].get("status", "unknown")
+            topic  = r["meta"].get("topic", "unknown")
+            coll   = r["collection"].upper()
+            print(f"  [{i+1}] [{coll}] [{status.upper()}] Topic: {topic}")
+            print(f"       ID  : {r['id'][:12]}...")
+            print(f"       Text: {r['doc'][:120]}...")
+            print()
+
+        # Pick a document
+        try:
+            pick = input("Pick a document number (or 'done' to exit/'back' to search again): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[ADMIN] Exiting admin mode.")
+            return
+
+        if pick.lower() in ("done", "exit"):
+            print("[ADMIN] Exiting admin mode.\n")
+            return
+        if pick.lower() == "back" or not pick:
+            continue
+
+        try:
+            idx = int(pick) - 1
+            if idx < 0 or idx >= len(results_list):
+                print("[ADMIN] Invalid number.\n")
+                continue
+        except ValueError:
+            print("[ADMIN] Enter a number.\n")
+            continue
+
+        selected = results_list[idx]
+        _admin_document_view(selected)
+
+
+def _admin_document_view(selected: dict):
+    """Display full document details and offer surgery options."""
+    coll_name = selected["collection"]
+    collection = active_collection if coll_name == "active" else candidate_collection
+    doc_id = selected["id"]
+    doc    = selected["doc"]
+    meta   = selected["meta"]
+
+    while True:
+        print(f"\n{'─'*60}")
+        print(f"[ADMIN] Document Surgery")
+        print(f"{'─'*60}")
+        print(f"  Collection : {coll_name.upper()}")
+        print(f"  ID         : {doc_id}")
+        print(f"  Status     : {meta.get('status', 'unknown')}")
+        print(f"  Topic      : {meta.get('topic', 'unknown')}")
+        print(f"  Source     : {meta.get('source', 'unknown')}")
+        print(f"{'─'*60}")
+        print(f"  FULL TEXT:")
+        print(f"  {doc}")
+        print(f"{'─'*60}")
+        print(f"  METADATA:")
+        for k, v in meta.items():
+            print(f"    {k}: {v}")
+        print(f"{'─'*60}")
+        print(f"\n  Surgery Options:")
+        print(f"    edit    — Rewrite the entire document")
+        print(f"    replace — Find and replace specific text")
+        print(f"    delete  — Permanently remove this document")
+        print(f"    back    — Return to search\n")
+
+        try:
+            action = input("  Action: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[ADMIN] Returning to search.")
+            return
+
+        if action == "back" or not action:
+            return
+
+        elif action == "edit":
+            print("\n  Type your new document below. Type 'END' on a new line when done.")
+            lines = []
+            while True:
+                try:
+                    line = input("  > ")
+                except (KeyboardInterrupt, EOFError):
+                    print("\n[ADMIN] Edit cancelled.")
+                    break
+                if line.strip() == "END":
+                    break
+                lines.append(line)
+
+            if lines:
+                new_doc = "\n".join(lines)
+                try:
+                    # Re-embed and update the document
+                    new_embed = get_embedding(new_doc)
+                    collection.update(
+                        ids=[doc_id],
+                        documents=[new_doc],
+                        embeddings=[new_embed]
+                    )
+                    doc = new_doc  # update local copy
+                    print(f"\n  [ADMIN] ✓ Document updated and re-embedded.")
+                except Exception as e:
+                    print(f"\n  [ADMIN] Error updating document: {e}")
+
+        elif action == "replace":
+            try:
+                old_text = input("  Find text    : ").strip()
+                new_text = input("  Replace with : ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n[ADMIN] Replace cancelled.")
+                continue
+
+            if not old_text:
+                print("  [ADMIN] No search text provided.")
+                continue
+
+            if old_text not in doc:
+                print(f"  [ADMIN] ✗ Text '{old_text}' not found in document.")
+                continue
+
+            new_doc = doc.replace(old_text, new_text)
+            count = doc.count(old_text)
+            try:
+                new_embed = get_embedding(new_doc)
+                collection.update(
+                    ids=[doc_id],
+                    documents=[new_doc],
+                    embeddings=[new_embed]
+                )
+                doc = new_doc
+                print(f"\n  [ADMIN] ✓ Replaced {count} occurrence(s) and re-embedded.")
+            except Exception as e:
+                print(f"\n  [ADMIN] Error replacing: {e}")
+
+        elif action == "delete":
+            try:
+                confirm = input(f"  Are you sure you want to DELETE {doc_id[:12]}...? (yes/no): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\n[ADMIN] Delete cancelled.")
+                continue
+
+            if confirm == "yes":
+                try:
+                    collection.delete(ids=[doc_id])
+                    print(f"  [ADMIN] ✓ Document {doc_id[:12]}... permanently deleted.")
+                    return  # go back to search since the doc no longer exists
+                except Exception as e:
+                    print(f"  [ADMIN] Error deleting: {e}")
+            else:
+                print("  [ADMIN] Delete cancelled.")
+
+        else:
+            print("  [ADMIN] Unknown action. Use: edit, replace, delete, or back.")
 
 
 def main():
@@ -127,6 +393,10 @@ def main():
             show_status()
         elif cmd == "docs":
             show_active_docs()
+        elif cmd == "forensics":
+            show_forensics()
+        elif cmd == "admin":
+            admin_mode()
         elif cmd == "help":
             print_help()
         elif cmd == "full":
