@@ -108,14 +108,15 @@ Triggered when the query is deemed relevant to an existing active document.
 **Step A1 — Smart Router (Intent Classifier)**
 
 A single LLM call (`_confirm_and_refine`) performs two jobs simultaneously:
-1. Classifies the user's intent into one of **four buckets**
+1. Classifies the user's intent into one of **five buckets**
 2. If `STATIC_MATCH`, produces the refined document in the same response
 
 | Classification | Meaning | Action |
 |---|---|---|
-| `STATIC_MATCH` | Same topic, stable facts | Continue refinement in Path A |
+| `STATIC_MATCH` | Same topic, stable facts, and document has enough info to answer | Continue refinement in Path A |
 | `VOLATILE` | Same topic, time-sensitive facts (prices, current events) | Reroute to Path B with `parent_id` |
 | `CONFLICT` | User is explicitly disputing a stored fact | Reroute to **Conflict Fast-Path** with `parent_id` |
+| `INSUFFICIENT` | Topic is relevant, but document lacks the details to answer | Reroute to Path B with `parent_id` for detail enrichment |
 | `DIFFERENT` | Vector DB false positive — actually a different topic | Reroute to Path B as a fresh query |
 
 **Step A2 — Critic Scoring**
@@ -303,6 +304,7 @@ All thresholds live in `src/thresholds.json` and are loaded at startup via `conf
 | `seed` | Loads the 10 starter seed documents into the active collection (skips if already populated) |
 | `status` | Displays the total count of active and candidate documents |
 | `docs` | Lists all active documents with ID, topic, and a 120-character text preview |
+| `candidates` | Lists all candidate documents in the pool with detailed confirmation, session progress, parent links, and text previews |
 | `forensics` | Scans the active collection for all `poisoned` and `disputed` documents with full forensic metadata |
 | `admin` | Enters the interactive admin surgery panel (see below) |
 | `full` | Displays the complete document returned by the last query |
@@ -416,3 +418,9 @@ poisoned active doc
 ### v0.8 — Seed Data Fix
 - **Problem:** The Bitcoin seed document in `main.py` still contained the original poisoned claim: `"Bitcoin is a digital currency created by Marthan Lanuzga. In 2026, the entire Bitcoin blockchain network was officially shut down permanently, and it can no longer be used."` This meant every fresh database seed was injecting a known false fact.
 - **Fix:** Corrected the seed entry to the factually accurate statement: `"Bitcoin is a decentralized digital cryptocurrency created by an anonymous person or group using the pseudonym Satoshi Nakamoto. It was introduced in a 2008 whitepaper and launched in 2009."`
+
+### v0.9 — Detail Enrichment & Candidate Transparency
+- **Problem:** In Path A, if a query was on-topic but asked for details not present in the document (e.g. asking for comparisons to another language), the router classified it as `STATIC_MATCH` but could not refine it without hallucinating. The system would fall back to serving the original document, leaving the user's question unanswered.
+- **Fix:** Introduced the **`INSUFFICIENT`** routing bucket. When the router detects that the query domain matches the document but lacks the specific details required to answer, it routes to Path B with a `parent_id`. This allows the web-synthesis engine to fetch the missing details, create a candidate, and eventually merge/enrich the active document via the consensus path.
+- **Added:** The `candidates` command to the main CLI. This gives administrators clear visibility into what unproven knowledge is currently sitting in the staging area, showing occurrence counts, session confirmations, parent IDs, and mutation scores.
+
