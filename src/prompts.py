@@ -53,11 +53,12 @@ USER QUERY:
 {user_query}
 
 STEP 1 — INTENT & RELEVANCE CLASSIFICATION
-Analyze the user query against the document. Categorize it into EXACTLY ONE of these four buckets:
+Analyze the user query against the document. Categorize it into EXACTLY ONE of these five buckets:
 1. DIFFERENT: The query is asking about a completely different topic than what the document covers.
 2. VOLATILE: The query is asking about time-sensitive information (prices, current leaders, recent news) where the document's facts might be outdated.
 3. CONFLICT: The user is explicitly disputing or contradicting a fact in the document.
-4. STATIC_MATCH: The query is about the same topic, and deals with stable facts (history, code, established concepts) that rarely change.
+4. INSUFFICIENT: The query falls within the document's domain, but the document lacks the specific knowledge required to fully resolve it. The user is asking about subtopics, comparisons, mechanisms, or details that simply do not exist anywhere in the document's text. Do NOT hallucinate an answer from your own training data — classify as INSUFFICIENT and let the system retrieve the missing knowledge externally.
+5. STATIC_MATCH: The query is about the same topic, deals with stable facts, AND the document contains enough information to fully answer it.
 
 STEP 2 — IF STATIC_MATCH: produce the refined document
 Rules:
@@ -68,7 +69,7 @@ Rules:
 
 Respond in EXACTLY this format:
 
-ROUTING: STATIC_MATCH | VOLATILE | CONFLICT | DIFFERENT
+ROUTING: STATIC_MATCH | VOLATILE | CONFLICT | DIFFERENT | INSUFFICIENT
 MUTATION_TYPE: expansion | none
 REFINED_DOCUMENT:
 <your refined document here, or leave blank if not STATIC_MATCH>

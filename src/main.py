@@ -81,17 +81,48 @@ def show_active_docs():
         print()
 
 
+def show_candidates():
+    results = candidate_collection.get(include=["documents", "metadatas"])
+    if not results["ids"]:
+        print("[CANDIDATES] No candidate documents found.")
+        return
+    print(f"\n[CANDIDATES] {len(results['ids'])} candidate(s) awaiting confirmation:\n")
+    for i, (doc_id, doc, meta) in enumerate(zip(results["ids"], results["documents"], results["metadatas"])):
+        import json as _json
+        sessions = _json.loads(meta.get("source_sessions", "[]"))
+        distinct  = len(set(sessions))
+        count     = int(meta.get("occurrence_count", 1))
+        score     = meta.get("score", meta.get("mutation_score", "N/A"))
+        query     = meta.get("query", "unknown")
+        source    = meta.get("source", "unknown")
+        parent    = meta.get("original_id", meta.get("parent_id", "none"))
+
+        print(f"  [{i+1}] ID        : {doc_id[:8]}...")
+        print(f"       Query     : {query}")
+        print(f"       Source    : {source}")
+        print(f"       Score     : {score}")
+        print(f"       Count     : {count} / 2")
+        print(f"       Sessions  : {distinct} distinct")
+        if parent and parent != "none":
+            print(f"       Parent    : {parent[:8]}...")
+        else:
+            print(f"       Parent    : none")
+        print(f"       Text      : {doc[:120]}...")
+        print()
+
+
 def print_help():
     print("""
 Commands:
-  seed       — Load starter documents into the knowledge base
-  status     — Show active and candidate document counts
-  docs       — List all active documents
-  forensics  — View all poisoned and disputed documents
-  admin      — Enter admin mode (database surgery)
-  full       — View the full document from the last query
-  help       — Show this menu
-  quit       — Exit
+  seed        — Load starter documents into the knowledge base
+  status      — Show active and candidate document counts
+  docs        — List all active documents
+  candidates  — List all candidate documents with confirmation progress
+  forensics   — View all poisoned and disputed documents
+  admin       — Enter admin mode (database surgery)
+  full        — View the full document from the last query
+  help        — Show this menu
+  quit        — Exit
 
 Anything else is treated as a query to the AKM pipeline.
 """)
@@ -393,6 +424,8 @@ def main():
             show_status()
         elif cmd == "docs":
             show_active_docs()
+        elif cmd == "candidates":
+            show_candidates()
         elif cmd == "forensics":
             show_forensics()
         elif cmd == "admin":
