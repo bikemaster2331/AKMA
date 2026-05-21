@@ -2,7 +2,6 @@ import uuid
 import json
 import numpy as np
 from datetime import datetime
-from rank_bm25 import BM25Okapi
 from groq import Groq
 
 from database import active_collection, candidate_collection, get_embedding
@@ -20,7 +19,6 @@ from config import (
     WEB_CANDIDATE_MATCH_THRESHOLD,
     DELTA_MATCH_THRESHOLD,
     IDENTICAL_REFINEMENT_THRESHOLD,
-    BM25_QUERY_THRESHOLD,
     RELEVANCE_THRESHOLD,
 )
 from prompts import CONFIRM_AND_REFINE_PROMPT, SUMMARIZE_FOR_QUERY_PROMPT
@@ -35,23 +33,6 @@ def cosine_similarity(vec1: list, vec2: list) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def bm25_query_similarity(stored_query: str, incoming_query: str) -> float:
-    """Normalized BM25 similarity between two queries. Returns 0-1.
-    Better than cosine at catching keyword differences (dates, names, numbers)."""
-    stored_tokens  = stored_query.lower().split()
-    incoming_tokens = incoming_query.lower().split()
-
-    if not stored_tokens or not incoming_tokens:
-        return 0.0
-
-    bm25 = BM25Okapi([stored_tokens])
-    score     = bm25.get_scores(incoming_tokens)[0]
-    max_score = bm25.get_scores(stored_tokens)[0]
-
-    if max_score == 0:
-        return 0.0
-
-    return min(score / max_score, 1.0)
 
 
 # ── Main Entry Point ───────────────────────────────────────────────────────────
@@ -88,7 +69,6 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     print(f"[AKM] Doc Snippet   : {doc_original[:80].strip()}...")
     print(f"[AKM] Query-to-doc  : {doc_similarity:.4f} (threshold: {RELEVANCE_THRESHOLD})")
 
-    # ── Step 2: Route based on relevance ──────────────────────────────────────
     # ── Step 2: Route based on relevance ──────────────────────────────────────
     if doc_similarity < RELEVANCE_THRESHOLD:
         print(f"[AKM] No relevant document found — routing to PATH B (Web Search)")
@@ -168,7 +148,7 @@ def _refinement_path(
     
     if routing != "STATIC_MATCH":
         print(f"[AKM] Smart Router classified query as {routing} — rerouting to PATH B (Web Search)")
-        pass_parent = doc_id if routing in ["VOLATILE", "CONFLICT"] else None
+        pass_parent = doc_id if routing in ["VOLATILE", "CONFLICT", "INSUFFICIENT"] else None
         return _web_search_path(user_query, session_id, parent_id=pass_parent, routing=routing)
     
     doc_refined = refined["refined_text"]
