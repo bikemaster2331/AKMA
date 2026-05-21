@@ -182,6 +182,27 @@ The synthesised document is stored in `candidate_collection` with:
 
 ---
 
+### Step 3: The Summary Layer (Conversational Fail-Safe Referee)
+
+Once Path A or Path B has produced a resulting document (whether it is a new refinement, a new web synthesis, or the original document retrieved during a fallback), the final stage of `run_akm` executes a conversational synthesis:
+
+```python
+short_answer = summarize_for_query(user_query, full_doc)
+```
+
+This layer is governed by `SUMMARIZE_FOR_QUERY_PROMPT` in `prompts.py`, which strictly commands the LLM:
+> *"Answer the following question in 2-3 sentences using ONLY the document below... Do not mention the document or sources explicitly."*
+
+#### The Grounding Fallback Gate
+This step acts as the **ultimate, final fail-safe gate against system hallucination**:
+* If a query gets incorrectly routed to an active document that **does not actually contain the answer**, and Path A fails its quality checks, the pipeline falls back to returning the original document (`doc_original`).
+* When this original document is passed to the Summary Layer, the strict `using ONLY the document` constraint prevents the LLM from fabricating an answer using its pre-trained weights.
+* Instead of hallucinating a false fact, the LLM will politely decline to answer, returning: *"I'm sorry, but the provided information does not contain details about [the query]."*
+
+This provides a vital secondary defense layer, ensuring the user is served a safe refusal rather than a confident hallucination.
+
+---
+
 ### The Conflict Fast-Path
 
 When the Smart Router classifies a query as `CONFLICT`, the pipeline takes a special route that bypasses the candidate consensus queue entirely.
