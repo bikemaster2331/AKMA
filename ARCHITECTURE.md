@@ -119,12 +119,13 @@ A single LLM call (`_confirm_and_refine`) performs two jobs simultaneously:
 | `INSUFFICIENT` | Topic is relevant, but document lacks the details to answer | Reroute to Path B with `parent_id` for detail enrichment |
 | `DIFFERENT` | Vector DB false positive — actually a different topic | Reroute to Path B as a fresh query |
 
-**Step A2 — Critic Scoring**
+**Step A2 — Critic Scoring (Refinement Mode)**
 
-The Critic LLM reviews the refined document against the original. It checks:
-- Were all original facts preserved?
-- Are any facts softened, altered, or removed?
-- Are additions coherent and logically consistent?
+The Critic LLM (`critic.py → _score_refinement()`) reviews the refined document against the original using the `SCORE_REFINEMENT_PROMPT`. It performs a structured 4-step audit:
+1. **Fact Inventory** — Lists every specific fact in the original (names, dates, numbers).
+2. **Preservation Audit** — Checks each original fact: preserved exactly (OK), softened (WARN), altered/removed (FAIL).
+3. **Structural Audit** — Reviews additions for coherence and internal consistency. Crucially, the Critic is **forbidden from using its own training data** to judge factual accuracy — it only checks structural integrity.
+4. **Final Score** — A 0.0–1.0 rubric score.
 
 Score must meet `REJECTION_THRESHOLD` (0.70) to proceed.
 
@@ -149,18 +150,25 @@ Triggered when no relevant active document exists for the query.
 
 **Step B1 — Web Search**
 
-Tavily API is queried with the user's raw question. Returns up to 5 source URLs and their content. Blocked domains (Wikipedia, Reddit, Quora, Medium, social media) are filtered out.
+Tavily API is queried with the user's raw question. Returns up to 5 source URLs and their content.
+
+Search results are filtered through two domain lists defined in `config.py`:
+- **Blocked Domains** (excluded): `wikipedia.org`, `reddit.com`, `quora.com`, `medium.com`, `twitter.com`, `x.com`, `facebook.com`
+- **Trusted Domains** (prioritised): `docs.python.org`, `arxiv.org`, `github.com`, `stackoverflow.com`, `developer.mozilla.org`, `docs.microsoft.com`, `ieee.org`, `nature.com`, `sciencedirect.com`
+
+Per-source content is capped at 1,000 characters to prevent context overflow.
 
 **Step B2 — Synthesis**
 
-The LLM reads the web sources and synthesises a clean, structured document answering the query. The synthesis is grounded strictly in the returned sources.
+The LLM reads the web sources and synthesises a clean, structured document answering the query using `SYNTHESIZE_FROM_SEARCH_PROMPT`. The synthesis is grounded strictly in the returned sources. If sources conflict, the LLM is instructed to note the discrepancies rather than silently choosing one version.
 
-**Step B3 — Critic Scoring (Synthesis)**
+**Step B3 — Critic Scoring (Synthesis Mode)**
 
-The Critic scores the synthesised document against the raw web sources:
-- Does the document cover key facts from the sources?
-- Does the document introduce any fabricated claims not in the sources?
-- Is the document internally consistent?
+The Critic scores the synthesised document in a different mode than Path A. Instead of comparing against an original document, `critic.py → _score_synthesis()` uses the `SCORE_SYNTHESIS_PROMPT` to evaluate the synthesis against the raw web evidence:
+1. **Source Coverage** — Does the document capture key facts from the sources?
+2. **Fabrication Check** — Does it introduce any claims NOT present in the sources?
+3. **Coherence Check** — Is the document internally consistent?
+4. **Final Score** — A 0.0–1.0 rubric score.
 
 Score must meet `REJECTION_THRESHOLD` (0.70) to proceed.
 
@@ -253,7 +261,36 @@ On promotion, the pipeline:
 3. The new document is added to `active_collection` with `status: "active"` and provenance fields like `promoted_from_candidate`, `promoted_at`, and `parent_id`.
 4. The candidate is deleted from `candidate_collection`.
 
-For web candidates specifically, the pipeline also runs one final LLM refinement pass on the candidate before promoting it, to ensure the document is well-integrated. If the refinement degrades quality below `REJECTION_THRESHOLD`, it falls back to the raw candidate text.
+For web candidates specifically, the pipeline runs one final LLM refinement pass on the candidate before promoting it, using the standalone `refiner.py` module and `REFINE_DOCUMENT_PROMPT`. This is a separate refinement step from the Smart Router's `CONFIRM_AND_REFINE_PROMPT` — it takes the confirming user's query and integrates it into the candidate document for a cleaner final product. If the refinement degrades quality below `REJECTION_THRESHOLD`, it falls back to the raw candidate text.
+
+---
+
+## 7. Auxiliary Modules
+
+### The Claim Extraction & Grounding Pipeline (`searcher.py`)
+
+In addition to the primary `search_web()` and `synthesize_from_search()` functions used in Path B, `searcher.py` contains a full standalone claim-verification pipeline:
+
+1. **`extract_claims(document)`** — Uses the LLM with `EXTRACT_CLAIMS_PROMPT` to extract up to `MAX_CLAIMS_TO_CHECK` (3) specific, verifiable factual claims from any document.
+2. **`search_claim(claim)`** — Searches Tavily for a single claim, filters blocked domains, and returns a structured result with `grounded: true/false` based on whether `MIN_SEARCH_RESULTS` (2) supporting sources were found.
+3. **`ground_document(document)`** — Orchestrates the full pipeline: extract claims → search each claim → build an evidence block with `[VERIFIED]`/`[UNVERIFIED]` labels for the Critic to consume.
+
+This pipeline is available for future deep-audit use cases (e.g. periodic background verification of active documents).
+
+### The Refiner (`refiner.py`)
+
+A standalone document refinement module using `REFINE_DOCUMENT_PROMPT`. Unlike the Smart Router's combined classify-and-refine call, the Refiner is a pure refinement tool with no routing logic. It is currently used at web candidate promotion time to polish the candidate document before it enters the active collection.
+
+### Search Configuration Constants (`config.py`)
+
+Beyond the tunable thresholds in `thresholds.json`, `config.py` defines:
+
+| Constant | Value | Description |
+|---|---|---|
+| `BLOCKED_DOMAINS` | 7 domains | Domains excluded from all Tavily searches |
+| `TRUSTED_DOMAINS` | 9 domains | Domains prioritised in search results |
+| `MAX_CLAIMS_TO_CHECK` | 3 | Maximum claims extracted per document for grounding |
+| `MIN_SEARCH_RESULTS` | 2 | Minimum sources required for a claim to be considered "grounded" |
 
 ---
 
@@ -408,8 +445,8 @@ poisoned active doc
 ### v0.4 — Smart Router / Intent Classifier
 - **Added:** The `CONFIRM_AND_REFINE_PROMPT` in `prompts.py` and the `_confirm_and_refine()` function in `pipeline.py`.
 - **What it does:** Combines intent classification and document refinement into a **single LLM API call** at the start of Path A, saving latency and tokens.
-- The classifier routes queries into four buckets: `STATIC_MATCH`, `VOLATILE`, `CONFLICT`, and `DIFFERENT`.
-- `VOLATILE` and `CONFLICT` queries are rerouted to Path B with a `parent_id` link to the original document for forensic chaining.
+- The classifier routes queries into five buckets: `STATIC_MATCH`, `VOLATILE`, `CONFLICT`, `INSUFFICIENT`, and `DIFFERENT`.
+- `VOLATILE`, `CONFLICT`, and `INSUFFICIENT` queries are rerouted to Path B with a `parent_id` link to the original document.
 - `DIFFERENT` queries are rerouted to Path B as fresh, unknown queries.
 
 ### v0.5 — Conflict Resolution & Poisoned Entry Handling
