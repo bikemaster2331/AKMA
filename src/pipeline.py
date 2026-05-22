@@ -254,7 +254,10 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
     if not search_results:
         print("[AKM] No web results found — cannot answer this query")
         if is_conflict:
-            _quarantine_document(parent_id, user_query, session_id, reason="no_web_evidence")
+            _log_unverified_dispute(parent_id, user_query, session_id, reason="no_web_evidence")
+            orig_doc = _get_active_document_text(parent_id)
+            if orig_doc:
+                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     print(f"[AKM] Got {len(search_results)} source(s) from web")
@@ -266,7 +269,10 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
     if not new_document:
         print("[AKM] Synthesis failed")
         if is_conflict:
-            _quarantine_document(parent_id, user_query, session_id, reason="synthesis_failed")
+            _log_unverified_dispute(parent_id, user_query, session_id, reason="synthesis_failed")
+            orig_doc = _get_active_document_text(parent_id)
+            if orig_doc:
+                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     # Step B3: Critic judges the synthesized document
@@ -284,7 +290,10 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
     if score < REJECTION_THRESHOLD:
         print(f"[AKM] Synthesis rejected — sources insufficient or incoherent")
         if is_conflict:
-            _quarantine_document(parent_id, user_query, session_id, reason="synthesis_rejected")
+            _log_unverified_dispute(parent_id, user_query, session_id, reason="synthesis_rejected")
+            orig_doc = _get_active_document_text(parent_id)
+            if orig_doc:
+                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     # ── CONFLICT FAST-PATH: Immediate replacement ─────────────────────────────
@@ -292,9 +301,31 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
         print("[AKM] ⚠ CONFLICT — Web evidence verified. Replacing poisoned document immediately.")
         return _conflict_replace(parent_id, new_document, score, user_query, session_id)
 
+    # Step B3.4: Active Pool Deduplication
+    print("[AKM] Checking if this knowledge already exists in Active Pool...")
+    new_doc_embed = get_embedding(new_document)
+
+    try:
+        active_match = active_collection.query(
+            query_embeddings=[new_doc_embed],
+            n_results=1,
+            where={"status": "active"},
+            include=["documents", "metadatas", "embeddings"]
+        )
+        if active_match["documents"] and active_match["documents"][0]:
+            active_embed = active_match["embeddings"][0][0]
+            active_sim = cosine_similarity(new_doc_embed, active_embed)
+            if active_sim >= WEB_CANDIDATE_MATCH_THRESHOLD:
+                print(f"[AKM] ✗ Duplicate knowledge — semantic match found in Active Pool (Sim: {active_sim:.4f} >= {WEB_CANDIDATE_MATCH_THRESHOLD})")
+                print("[AKM] Discarding candidate creation since the database already holds this knowledge.")
+                return active_match["documents"][0][0]
+            else:
+                print(f"[AKM] Active pool check complete. Unique knowledge (Sim: {active_sim:.4f} < {WEB_CANDIDATE_MATCH_THRESHOLD}).")
+    except Exception as e:
+        print(f"[AKM] Active pool deduplication check error: {e}")
+
     # Step B3.5: Semantic Candidate Deduplication
     print("[AKM] Checking if this knowledge already exists in Candidates...")
-    new_doc_embed = get_embedding(new_document)
 
     try:
         existing = candidate_collection.query(
@@ -498,36 +529,45 @@ def _conflict_replace(parent_id: str, new_document: str, score: float, user_quer
     return new_document
 
 
-def _quarantine_document(doc_id: str, user_query: str, session_id: str, reason: str = "unknown") -> None:
+def _get_active_document_text(doc_id: str) -> str:
+    try:
+        data = active_collection.get(ids=[doc_id], include=["documents"])
+        if data["documents"] and data["documents"][0]:
+            return data["documents"][0]
+    except Exception as e:
+        print(f"[AKM] Error fetching active document text: {e}")
+    return ""
+
+
+def _log_unverified_dispute(doc_id: str, user_query: str, session_id: str, reason: str = "unknown") -> None:
     """
-    Quarantines a disputed active document so it is no longer served to users.
-    Triggered when a CONFLICT is detected but the web cannot provide a verified correction.
+    Logs an unverified dispute in the active document's metadata.
+    The document status remains 'active' to prevent Denial-of-Service / Censorship attacks.
     """
     try:
         doc_data = active_collection.get(ids=[doc_id], include=["metadatas"])
         if doc_data["metadatas"] and doc_data["metadatas"][0]:
             original_meta = doc_data["metadatas"][0]
 
-            # Only quarantine if it's still active (avoid double-quarantine)
-            if original_meta.get("status") != "active":
-                print(f"[AKM] Document {doc_id[:8]}... already not active (status: {original_meta.get('status')}) — skipping quarantine.")
-                return
+            unverified_disputes = json.loads(original_meta.get("unverified_disputes", "[]"))
+            unverified_disputes.append({
+                "disputed_by" : session_id,
+                "dispute_query": user_query,
+                "disputed_at"  : datetime.utcnow().isoformat(),
+                "reason"       : reason
+            })
 
             active_collection.update(
                 ids=[doc_id],
                 metadatas=[{
                     **original_meta,
-                    "status"            : "disputed",
-                    "disputed_at"       : datetime.utcnow().isoformat(),
-                    "disputed_by"       : session_id,
-                    "dispute_query"     : user_query,
-                    "quarantine_reason" : reason,
+                    "unverified_disputes": json.dumps(unverified_disputes),
                 }]
             )
-            print(f"[AKM] 🔒 Document quarantined: {doc_id[:8]}... (reason: {reason})")
-            print(f"[AKM]   This document will no longer be served to users.")
+            print(f"[AKM] ⚠ Dispute logged for active document {doc_id[:8]}... (reason: {reason})")
+            print(f"[AKM]   Document remains ACTIVE and serving.")
     except Exception as e:
-        print(f"[AKM] Quarantine error: {e}")
+        print(f"[AKM] Error logging unverified dispute: {e}")
 
 
 # ── Web Candidate Helper ───────────────────────────────────────────────────────

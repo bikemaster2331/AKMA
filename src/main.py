@@ -151,22 +151,44 @@ def show_forensics():
                     print(f"       ID      : {doc_id[:8]}...")
                     print(f"       Topic   : {meta.get('topic', 'unknown')}")
                     print(f"       Text    : {doc[:150]}...")
-
+                    print(f"       Poisoned at    : {meta.get('poisoned_at', 'N/A')}" if status_label == "poisoned" else f"       Disputed at    : {meta.get('disputed_at', 'N/A')}")
+                    print(f"       Disputed by    : {meta.get('disputed_by', 'N/A')[:8]}...")
+                    print(f"       Dispute query  : {meta.get('dispute_query', 'N/A')}")
                     if status_label == "poisoned":
-                        print(f"       Poisoned at    : {meta.get('poisoned_at', 'N/A')}")
-                        print(f"       Disputed by    : {meta.get('disputed_by', 'N/A')[:8]}...")
-                        print(f"       Dispute query  : {meta.get('dispute_query', 'N/A')}")
                         print(f"       Original snap  : {meta.get('original_content', 'N/A')[:120]}...")
-                    elif status_label == "disputed":
-                        print(f"       Disputed at    : {meta.get('disputed_at', 'N/A')}")
-                        print(f"       Disputed by    : {meta.get('disputed_by', 'N/A')[:8]}...")
-                        print(f"       Dispute query  : {meta.get('dispute_query', 'N/A')}")
+                    else:
                         print(f"       Reason         : {meta.get('quarantine_reason', 'N/A')}")
         except Exception as e:
             print(f"  [FORENSICS] Error querying {status_label}: {e}")
 
+    # Also scan active documents for unverified disputes to display them in forensics
+    try:
+        import json
+        active_results = active_collection.get(
+            where={"status": "active"},
+            include=["documents", "metadatas"]
+        )
+        if active_results["ids"]:
+            for doc_id, doc, meta in zip(
+                active_results["ids"], active_results["documents"], active_results["metadatas"]
+            ):
+                if meta and "unverified_disputes" in meta:
+                    disputes = json.loads(meta.get("unverified_disputes", "[]"))
+                    for disp in disputes:
+                        found += 1
+                        print(f"\n  [{found}] Status  : ACTIVE (Dispute Logged)")
+                        print(f"       ID      : {doc_id[:8]}...")
+                        print(f"       Topic   : {meta.get('topic', 'unknown')}")
+                        print(f"       Text    : {doc[:150]}...")
+                        print(f"       Disputed at    : {disp.get('disputed_at', 'N/A')}")
+                        print(f"       Disputed by    : {disp.get('disputed_by', 'N/A')[:8]}...")
+                        print(f"       Dispute query  : {disp.get('dispute_query', 'N/A')}")
+                        print(f"       Reason         : {disp.get('reason', 'N/A')}")
+    except Exception as e:
+        print(f"  [FORENSICS] Error scanning active disputes: {e}")
+
     if found == 0:
-        print("\n  [FORENSICS] No poisoned or disputed documents found. Database is clean.")
+        print("\n  [FORENSICS] No poisoned, disputed, or active dispute logs found. Database is clean.")
 
     print(f"\n{'='*60}\n")
 
