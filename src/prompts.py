@@ -38,10 +38,10 @@ YOUR RULES:
 
 Respond in EXACTLY this format, with no extra commentary:
 
-MUTATION_TYPE: correction|expansion
-REFINED_DOCUMENT:
+<<<MUTATION_TYPE>>>: correction|expansion
+<<<REFINED_DOCUMENT>>>:
 <your refined document here>
-CHANGES_MADE:
+<<<CHANGES_MADE>>>:
 <one or two sentences describing what changed>"""
 
 CONFIRM_AND_REFINE_PROMPT = """You are a loyal knowledge editor. The DOCUMENT below is the absolute source of truth in this system. You must never override, contradict, or "correct" any fact in it using your own internal knowledge.
@@ -69,11 +69,11 @@ Rules:
 
 Respond in EXACTLY this format:
 
-ROUTING: STATIC_MATCH | VOLATILE | CONFLICT | DIFFERENT | INSUFFICIENT
-MUTATION_TYPE: expansion | none
-REFINED_DOCUMENT:
+<<<ROUTING>>>: STATIC_MATCH | VOLATILE | CONFLICT | DIFFERENT | INSUFFICIENT
+<<<MUTATION_TYPE>>>: expansion | none
+<<<REFINED_DOCUMENT>>>:
 <your refined document here, or leave blank if not STATIC_MATCH>
-CHANGES_MADE:
+<<<CHANGES_MADE>>>:
 <one sentence describing what changed, or 'N/A' if not STATIC_MATCH>"""
 
 SCORE_REFINEMENT_PROMPT = """You are a structural document auditor. A knowledge document has been refined. Your ONLY job is to verify that the refinement preserved the original content and that additions are coherent — NOT whether facts are "true" in the real world.
@@ -152,4 +152,23 @@ SUMMARIZE_FOR_QUERY_PROMPT = """Answer the following question in 2-3 sentences u
 QUESTION: {user_query}
 
 DOCUMENT:
+{document}"""
+
+CONFLICT_JUDGE_PROMPT = """A user disputed a fact in Document A. We searched the web and got Document B.
+
+Document A (original stored knowledge):
+{doc_original}
+
+Document B (web search evidence):
+{doc_web}
+
+The user's dispute:
+{dispute_query}
+
+Does Document B AGREE or DISAGREE with Document A on the specific point the user is disputing?
+Answer ONLY one word: AGREES or DISAGREES"""
+
+EXTRACT_TOPIC_PROMPT = """What is the main topic of this document in 1-3 words? Reply with ONLY the topic in lowercase, no explanation.
+
+Document:
 {document}"""

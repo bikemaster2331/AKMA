@@ -1,5 +1,6 @@
 import uuid
 import json
+import time
 import numpy as np
 from datetime import datetime
 from groq import Groq
@@ -21,7 +22,12 @@ from config import (
     IDENTICAL_REFINEMENT_THRESHOLD,
     RELEVANCE_THRESHOLD,
 )
-from prompts import CONFIRM_AND_REFINE_PROMPT, SUMMARIZE_FOR_QUERY_PROMPT
+from prompts import (
+    CONFIRM_AND_REFINE_PROMPT,
+    SUMMARIZE_FOR_QUERY_PROMPT,
+    CONFLICT_JUDGE_PROMPT,
+    EXTRACT_TOPIC_PROMPT,
+)
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -52,8 +58,13 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     )
 
     if not results["documents"] or not results["documents"][0]:
-        print("[AKM] No active documents found. Seed the database first.")
-        msg = "No knowledge base entries found. Type 'seed' to add starter data."
+        total = active_collection.count()
+        if total > 0:
+            print("[AKM] No active documents remain (all archived/poisoned).")
+            msg = "All documents have been archived or poisoned. Type 'reseed' to restore starter data, or use 'admin' to repair."
+        else:
+            print("[AKM] No active documents found. Seed the database first.")
+            msg = "No knowledge base entries found. Type 'seed' to add starter data."
         return msg, msg
 
     doc_original   = results["documents"][0][0]
@@ -96,14 +107,17 @@ def _confirm_and_refine(user_query: str, doc_original: str) -> dict:
         user_query=user_query
     )
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
-        temperature=0.3
-    )
-
-    text = response.choices[0].message.content.strip()
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.3
+        )
+        text = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[AKM] API error in confirm_and_refine: {e}")
+        return {"routing": "STATIC_MATCH", "refined_text": "", "mutation_type": "none"}
 
     routing       = "STATIC_MATCH"
     mutation_type = "expansion"
@@ -111,14 +125,14 @@ def _confirm_and_refine(user_query: str, doc_original: str) -> dict:
     in_refined    = False
 
     for line in text.split("\n"):
-        if line.startswith("ROUTING:"):
+        if line.startswith("<<<ROUTING>>>:"):
             routing = line.split(":", 1)[1].strip().upper()
-        elif line.startswith("MUTATION_TYPE:"):
+        elif line.startswith("<<<MUTATION_TYPE>>>:"):
             raw = line.split(":", 1)[1].strip().lower()
             mutation_type = raw if raw in ["correction", "expansion", "none"] else "expansion"
-        elif line.startswith("REFINED_DOCUMENT:"):
+        elif line.startswith("<<<REFINED_DOCUMENT>>>:"):
             in_refined = True
-        elif line.startswith("CHANGES_MADE:"):
+        elif line.startswith("<<<CHANGES_MADE>>>:"):
             in_refined = False
         elif in_refined:
             refined_text += line + "\n"
@@ -255,9 +269,6 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
         print("[AKM] No web results found — cannot answer this query")
         if is_conflict:
             _log_unverified_dispute(parent_id, user_query, session_id, reason="no_web_evidence")
-            orig_doc = _get_active_document_text(parent_id)
-            if orig_doc:
-                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     print(f"[AKM] Got {len(search_results)} source(s) from web")
@@ -270,9 +281,6 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
         print("[AKM] Synthesis failed")
         if is_conflict:
             _log_unverified_dispute(parent_id, user_query, session_id, reason="synthesis_failed")
-            orig_doc = _get_active_document_text(parent_id)
-            if orig_doc:
-                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     # Step B3: Critic judges the synthesized document
@@ -291,38 +299,76 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
         print(f"[AKM] Synthesis rejected — sources insufficient or incoherent")
         if is_conflict:
             _log_unverified_dispute(parent_id, user_query, session_id, reason="synthesis_rejected")
-            orig_doc = _get_active_document_text(parent_id)
-            if orig_doc:
-                return orig_doc
         return "I couldn't find reliable information on this topic."
 
     # ── CONFLICT FAST-PATH: Immediate replacement ─────────────────────────────
     if is_conflict:
-        print("[AKM] ⚠ CONFLICT — Web evidence verified. Replacing poisoned document immediately.")
+        # Before replacing, use an LLM judge to check if the web evidence
+        # AGREES or DISAGREES with the original on the specific disputed point.
+        # (Cosine similarity can't detect factual disagreement — same-topic
+        # documents always score high regardless of contradicting facts.)
+        try:
+            parent_data = active_collection.get(
+                ids=[parent_id], include=["documents"]
+            )
+            if parent_data["documents"] and parent_data["documents"][0]:
+                original_doc = parent_data["documents"][0]
+                judge_prompt = CONFLICT_JUDGE_PROMPT.format(
+                    doc_original=original_doc[:1500],
+                    doc_web=new_document[:1500],
+                    dispute_query=user_query
+                )
+                try:
+                    judge_response = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "user", "content": judge_prompt}],
+                        max_tokens=10,
+                        temperature=0
+                    )
+                    verdict = judge_response.choices[0].message.content.strip().upper()
+                    print(f"[AKM] Conflict Judge verdict: {verdict}")
+
+                    if "AGREES" in verdict:
+                        print(f"[AKM] ✓ Web evidence CONFIRMS the original document is correct.")
+                        print(f"[AKM]   The user's dispute was wrong. Original remains active.")
+                        _log_unverified_dispute(parent_id, user_query, session_id, reason="web_confirmed_original")
+                        return new_document
+                except Exception as e:
+                    print(f"[AKM] Conflict judge API error: {e}")
+        except Exception as e:
+            print(f"[AKM] Agreement check error: {e}")
+
+        print("[AKM] ⚠ CONFLICT — Web evidence contradicts original. Replacing poisoned document immediately.")
         return _conflict_replace(parent_id, new_document, score, user_query, session_id)
 
     # Step B3.4: Active Pool Deduplication
-    print("[AKM] Checking if this knowledge already exists in Active Pool...")
+    # Skip this check when we're enriching a known parent doc (VOLATILE/INSUFFICIENT)
+    # because the enriched doc will naturally be similar to its parent and would be
+    # incorrectly discarded as a "duplicate".
     new_doc_embed = get_embedding(new_document)
 
-    try:
-        active_match = active_collection.query(
-            query_embeddings=[new_doc_embed],
-            n_results=1,
-            where={"status": "active"},
-            include=["documents", "metadatas", "embeddings"]
-        )
-        if active_match["documents"] and active_match["documents"][0]:
-            active_embed = active_match["embeddings"][0][0]
-            active_sim = cosine_similarity(new_doc_embed, active_embed)
-            if active_sim >= WEB_CANDIDATE_MATCH_THRESHOLD:
-                print(f"[AKM] ✗ Duplicate knowledge — semantic match found in Active Pool (Sim: {active_sim:.4f} >= {WEB_CANDIDATE_MATCH_THRESHOLD})")
-                print("[AKM] Discarding candidate creation since the database already holds this knowledge.")
-                return active_match["documents"][0][0]
-            else:
-                print(f"[AKM] Active pool check complete. Unique knowledge (Sim: {active_sim:.4f} < {WEB_CANDIDATE_MATCH_THRESHOLD}).")
-    except Exception as e:
-        print(f"[AKM] Active pool deduplication check error: {e}")
+    if not parent_id:
+        print("[AKM] Checking if this knowledge already exists in Active Pool...")
+        try:
+            active_match = active_collection.query(
+                query_embeddings=[new_doc_embed],
+                n_results=1,
+                where={"status": "active"},
+                include=["documents", "metadatas", "embeddings"]
+            )
+            if active_match["documents"] and active_match["documents"][0]:
+                active_embed = active_match["embeddings"][0][0]
+                active_sim = cosine_similarity(new_doc_embed, active_embed)
+                if active_sim >= WEB_CANDIDATE_MATCH_THRESHOLD:
+                    print(f"[AKM] ✗ Duplicate knowledge — semantic match found in Active Pool (Sim: {active_sim:.4f} >= {WEB_CANDIDATE_MATCH_THRESHOLD})")
+                    print("[AKM] Discarding candidate creation since the database already holds this knowledge.")
+                    return active_match["documents"][0][0]
+                else:
+                    print(f"[AKM] Active pool check complete. Unique knowledge (Sim: {active_sim:.4f} < {WEB_CANDIDATE_MATCH_THRESHOLD}).")
+        except Exception as e:
+            print(f"[AKM] Active pool deduplication check error: {e}")
+    else:
+        print(f"[AKM] Skipping active pool dedup — enrichment of parent {parent_id[:8]}...")
 
     # Step B3.5: Semantic Candidate Deduplication
     print("[AKM] Checking if this knowledge already exists in Candidates...")
@@ -358,6 +404,7 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
         "occurrence_count": 1,
         "source_sessions" : json.dumps([session_id]),
         "timestamps"      : json.dumps([datetime.utcnow().isoformat()]),
+        "created_at"      : datetime.utcnow().isoformat(),
         "status"          : "candidate",
     }
     if parent_id:
@@ -442,6 +489,7 @@ def _insert_candidate(
             "occurrence_count": 1,
             "source_sessions" : json.dumps([session_id]),
             "timestamps"      : json.dumps([datetime.utcnow().isoformat()]),
+            "created_at"      : datetime.utcnow().isoformat(),
             "status"          : "candidate",
         }]
     )
@@ -454,12 +502,41 @@ def _insert_candidate(
 
 def _promote(candidate_id: str, original_id: str, refined_text: str, similarity_score: float) -> str:
 
+    # Fix 2: Null-check original_id to prevent crash on corrupted candidates
+    if not original_id:
+        print("[AKM] ⚠ WARNING: Candidate has no original_id. Promoting without archival.")
+        new_id = str(uuid.uuid4())
+        active_collection.add(
+            ids=[new_id],
+            documents=[refined_text],
+            metadatas=[{
+                "status"                 : "active",
+                "topic"                  : "unknown",
+                "promoted_from_candidate": candidate_id,
+                "promoted_at"            : datetime.utcnow().isoformat(),
+            }]
+        )
+        candidate_collection.delete(ids=[candidate_id])
+        print("[AKM] ✓ Promotion complete (no archival).")
+        return refined_text
+
     print("[AKM] Meaningful change — archiving original, activating refined...")
-    original_meta = active_collection.get(ids=[original_id])["metadatas"][0]
-    active_collection.update(
-        ids=[original_id],
-        metadatas=[{**original_meta, "status": "archived"}]
-    )
+    try:
+        original_meta = active_collection.get(ids=[original_id])["metadatas"][0]
+    except (IndexError, KeyError):
+        print(f"[AKM] ⚠ Could not find original document {original_id}. Promoting without archival.")
+        original_meta = {"topic": "unknown"}
+
+    # Fix 3: Guard against overwriting poisoned forensic metadata with "archived"
+    current_status = original_meta.get("status", "active")
+    if current_status == "poisoned":
+        print(f"[AKM] ⚠ Original is already poisoned — skipping archival to preserve forensics.")
+    elif current_status != "archived":
+        active_collection.update(
+            ids=[original_id],
+            metadatas=[{**original_meta, "status": "archived"}]
+        )
+
     new_id = str(uuid.uuid4())
     active_collection.add(
         ids=[new_id],
@@ -505,6 +582,18 @@ def _conflict_replace(parent_id: str, new_document: str, score: float, user_quer
             )
             print(f"[AKM] ☠ Poisoned document archived: {parent_id[:8]}...")
 
+            # Fix 1: Clean up orphaned candidates that reference the poisoned parent
+            try:
+                orphans = candidate_collection.get(
+                    where={"original_id": parent_id},
+                    include=["metadatas"]
+                )
+                if orphans["ids"]:
+                    candidate_collection.delete(ids=orphans["ids"])
+                    print(f"[AKM] Cleaned up {len(orphans['ids'])} orphaned candidate(s) linked to poisoned doc.")
+            except Exception as orphan_err:
+                print(f"[AKM] Orphan cleanup error: {orphan_err}")
+
             # Insert the corrected document as a new active entry
             new_id = str(uuid.uuid4())
             active_collection.add(
@@ -528,15 +617,6 @@ def _conflict_replace(parent_id: str, new_document: str, score: float, user_quer
 
     return new_document
 
-
-def _get_active_document_text(doc_id: str) -> str:
-    try:
-        data = active_collection.get(ids=[doc_id], include=["documents"])
-        if data["documents"] and data["documents"][0]:
-            return data["documents"][0]
-    except Exception as e:
-        print(f"[AKM] Error fetching active document text: {e}")
-    return ""
 
 
 def _log_unverified_dispute(doc_id: str, user_query: str, session_id: str, reason: str = "unknown") -> None:
@@ -618,10 +698,26 @@ def _increment_web_candidate(
             print(f"[AKM] Refinement below threshold — promoting raw candidate")
             doc_to_store = matched_doc
 
+        # Fix 12: Extract a clean canonical topic via LLM instead of raw query
+        topic = matched_meta.get("query", "unknown").replace(" ", "_")
+        try:
+            topic_resp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": EXTRACT_TOPIC_PROMPT.format(document=doc_to_store[:300])}],
+                max_tokens=10,
+                temperature=0
+            )
+            extracted = topic_resp.choices[0].message.content.strip().replace(" ", "_")
+            if extracted and len(extracted) < 50:
+                topic = extracted
+                print(f"[AKM] Extracted topic: {topic}")
+        except Exception as e:
+            print(f"[AKM] Topic extraction failed, using query fallback: {e}")
+
         meta = {
             "status"                 : "active",
             "source"                 : "web_search",
-            "topic"                  : matched_meta.get("query", "unknown").replace(" ", "_"),
+            "topic"                  : topic,
             "query"                  : matched_meta.get("query", ""),
             "promoted_from_candidate": matched_id,
             "promoted_at"            : datetime.utcnow().isoformat(),
@@ -634,10 +730,14 @@ def _increment_web_candidate(
             print(f"[AKM] Archiving parent document {parent_id}...")
             try:
                 original_meta = active_collection.get(ids=[parent_id])["metadatas"][0]
-                active_collection.update(
-                    ids=[parent_id],
-                    metadatas=[{**original_meta, "status": "archived"}]
-                )
+                # Fix 3: Guard against overwriting poisoned forensic metadata
+                if original_meta.get("status") == "poisoned":
+                    print(f"[AKM] ⚠ Parent already poisoned — skipping archival to preserve forensics.")
+                else:
+                    active_collection.update(
+                        ids=[parent_id],
+                        metadatas=[{**original_meta, "status": "archived"}]
+                    )
             except Exception as e:
                 print(f"[AKM] Could not archive parent document: {e}")
 
@@ -664,13 +764,17 @@ def _increment_web_candidate(
 # ── Summary Layer ──────────────────────────────────────────────────────────────
 
 def summarize_for_query(user_query: str, document: str) -> str:
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{
-            "role": "user",
-            "content": SUMMARIZE_FOR_QUERY_PROMPT.format(user_query=user_query, document=document)
-        }],
-        max_tokens=150,
-        temperature=0.3
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{
+                "role": "user",
+                "content": SUMMARIZE_FOR_QUERY_PROMPT.format(user_query=user_query, document=document)
+            }],
+            max_tokens=150,
+            temperature=0.3
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[AKM] Summary API error: {e}. Returning raw document.")
+        return document[:500]

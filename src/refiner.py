@@ -24,12 +24,12 @@ def refine_document(user_query: str, document_original: str) -> dict:
     in_refined_section = False
 
     for line in text.split("\n"):
-        if line.startswith("MUTATION_TYPE:"):
+        if line.startswith("<<<MUTATION_TYPE>>>:"):
             raw_type = line.split(":", 1)[1].strip().lower()
             mutation_type = raw_type if raw_type in ["correction", "expansion"] else "expansion"
-        elif line.startswith("REFINED_DOCUMENT:"):
+        elif line.startswith("<<<REFINED_DOCUMENT>>>:"):
             in_refined_section = True
-        elif line.startswith("CHANGES_MADE:"):
+        elif line.startswith("<<<CHANGES_MADE>>>:"):
             in_refined_section = False
         elif in_refined_section:
             refined_text += line + "\n"

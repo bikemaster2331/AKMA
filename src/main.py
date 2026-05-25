@@ -1,6 +1,10 @@
+import os
 import uuid
+import json
+from datetime import datetime, timedelta
 from database import active_collection, candidate_collection, get_embedding
 from pipeline import run_akm
+from config import CANDIDATE_MAX_AGE_DAYS
 
 
 SEED_DOCUMENTS = [
@@ -47,11 +51,13 @@ SEED_DOCUMENTS = [
 ]
 
 
-def seed_database():
-    existing_count = active_collection.count()
-    if existing_count > 0:
-        print(f"[SEED] Database already has {existing_count} active document(s). Skipping seed.")
-        return
+def seed_database(force=False):
+    if not force:
+        active_docs = active_collection.get(where={"status": "active"})
+        if active_docs["ids"]:
+            print(f"[SEED] Database has {len(active_docs['ids'])} active doc(s). Skipping seed.")
+            print(f"[SEED] Use 'reseed' to force re-seed.")
+            return
 
     ids  = [str(uuid.uuid4()) for _ in SEED_DOCUMENTS]
     docs = [d["text"] for d in SEED_DOCUMENTS]
@@ -111,14 +117,35 @@ def show_candidates():
         print()
 
 
+def cleanup_stale_candidates(max_age_days=CANDIDATE_MAX_AGE_DAYS):
+    """Remove candidate documents older than max_age_days that were never confirmed."""
+    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+    all_cands = candidate_collection.get(include=["metadatas"])
+    if not all_cands["ids"]:
+        print(f"[CLEANUP] No candidates in pool.")
+        return
+
+    stale = [
+        cid for cid, meta in zip(all_cands["ids"], all_cands["metadatas"])
+        if meta.get("created_at", "9999") < cutoff
+    ]
+    if stale:
+        candidate_collection.delete(ids=stale)
+        print(f"[CLEANUP] Removed {len(stale)} stale candidate(s) older than {max_age_days} days.")
+    else:
+        print(f"[CLEANUP] No stale candidates found (all younger than {max_age_days} days).")
+
+
 def print_help():
     print("""
 Commands:
   seed        — Load starter documents into the knowledge base
+  reseed      — Force re-seed (adds starter docs even if DB is non-empty)
   status      — Show active and candidate document counts
   docs        — List all active documents
   candidates  — List all candidate documents with confirmation progress
   forensics   — View all poisoned and disputed documents
+  cleanup     — Remove stale candidates older than 30 days
   admin       — Enter admin mode (database surgery)
   full        — View the full document from the last query
   help        — Show this menu
@@ -414,11 +441,25 @@ def _admin_document_view(selected: dict):
             print("  [ADMIN] Unknown action. Use: edit, replace, delete, or back.")
 
 
+def get_or_create_session_id() -> str:
+    """Persist session ID so the same machine reuses it across restarts."""
+    session_file = os.path.join(os.path.dirname(__file__), ".session_id")
+    if os.path.exists(session_file):
+        with open(session_file) as f:
+            sid = f.read().strip()
+            if sid:
+                return sid
+    sid = str(uuid.uuid4())
+    with open(session_file, "w") as f:
+        f.write(sid)
+    return sid
+
+
 def main():
     print("\n=== Autonomous Knowledge Mutation — MVP ===")
     print("Type 'help' for available commands.\n")
 
-    session_id = str(uuid.uuid4())
+    session_id = get_or_create_session_id()
     print(f"Session ID: {session_id[:8]}...\n")
 
     show_status()
@@ -442,12 +483,16 @@ def main():
             break
         elif cmd == "seed":
             seed_database()
+        elif cmd == "reseed":
+            seed_database(force=True)
         elif cmd == "status":
             show_status()
         elif cmd == "docs":
             show_active_docs()
         elif cmd == "candidates":
             show_candidates()
+        elif cmd == "cleanup":
+            cleanup_stale_candidates()
         elif cmd == "forensics":
             show_forensics()
         elif cmd == "admin":

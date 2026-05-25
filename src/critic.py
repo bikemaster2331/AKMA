@@ -75,6 +75,7 @@ def _score_synthesis(document_refined: str, evidence: str) -> float:
 def _parse_score(raw_text: str) -> float:
     """
     Extracts the score from the last line of the model's reasoning output.
+    Only accepts scores in the valid 0.0–1.0 range.
     Falls back gracefully if parsing fails.
     """
     lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
@@ -85,9 +86,13 @@ def _parse_score(raw_text: str) -> float:
         cleaned = line.replace("*", "").replace("Score:", "").replace("score:", "").strip()
         try:
             score = float(cleaned)
-            parsed = round(max(0.0, min(1.0, score)), 4)
-            print(f"  [CRITIC] Reasoning complete. Score: {parsed}")
-            return parsed
+            if 0.0 <= score <= 1.0:
+                parsed = round(score, 4)
+                print(f"  [CRITIC] Reasoning complete. Score: {parsed}")
+                return parsed
+            else:
+                print(f"  [CRITIC] Ignoring out-of-range score: {score}")
+                continue
         except ValueError:
             continue
 

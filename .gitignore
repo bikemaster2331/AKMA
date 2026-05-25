@@ -16,3 +16,6 @@ akm_db_test/
 # OS
 .DS_Store
 Thumbs.db
+
+# Session persistence
+src/.session_id

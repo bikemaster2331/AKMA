@@ -51,7 +51,7 @@ AKM is a locally-running, autonomous knowledge pipeline. It does not simply quer
 akm/
 ├── src/
 │   ├── main.py          # CLI entry point, all commands, admin mode
-│   ├── pipeline.py      # Core AKM routing logic, all paths, conflict & quarantine handlers
+│   ├── pipeline.py      # Core AKM routing logic, all paths, conflict & dispute handlers
 │   ├── searcher.py      # Web search (Tavily), claim extraction, document synthesis
 │   ├── critic.py        # LLM-based document scoring (synthesis & refinement)
 │   ├── refiner.py       # Document refinement via LLM
@@ -92,11 +92,11 @@ Every user query triggers this sequence:
 1. The query is embedded into a vector.
 2. ChromaDB performs a nearest-neighbour search across all **active** documents.
 3. Cosine similarity is computed between the query embedding and the retrieved document's embedding.
-4. The score is compared against `RELEVANCE_THRESHOLD` (0.4):
+4. The score is compared against `RELEVANCE_THRESHOLD` (0.50):
 
 ```
-Query similarity >= 0.4  →  PATH A (Refinement)
-Query similarity <  0.4  →  PATH B (Web Search)
+Query similarity >=  0.50  →  PATH A (Refinement)
+Query similarity <   0.50  →  PATH B (Web Search)
 ```
 
 ---
@@ -172,14 +172,26 @@ The Critic scores the synthesised document in a different mode than Path A. Inst
 
 Score must meet `REJECTION_THRESHOLD` (0.70) to proceed.
 
+**Step B3.4 — Active Pool Deduplication**
+
+Before checking the candidate pool, the system first checks if the synthesized document already exists in the **active** collection — but **only for fresh queries** (no `parent_id`). When Path B is handling a rerouted `VOLATILE` or `INSUFFICIENT` query, the synthesized document will naturally be semantically similar to its parent active document. Running active pool deduplication in this case would incorrectly discard the enrichment as a "duplicate." The skip condition is:
+
+```python
+if not parent_id:  # Only dedup for genuinely fresh queries
+    # ... run active pool deduplication
+```
+
+For fresh queries, the new document is embedded and compared against all active documents using cosine similarity (`>= WEB_CANDIDATE_MATCH_THRESHOLD: 0.85`).
+
+- **Match found:** The synthesized document is discarded entirely. The existing active document is returned to the user. No candidate is created.
+- **No match:** Proceed to candidate deduplication.
+
 **Step B3.5 — Semantic Candidate Deduplication**
 
-Before storing a new candidate, the system embeds the new document and checks it against all existing web-search candidates using cosine similarity (`>= WEB_CANDIDATE_MATCH_THRESHOLD: 0.85`).
+The system embeds the new document and checks it against all existing web-search candidates using cosine similarity (`>= WEB_CANDIDATE_MATCH_THRESHOLD: 0.85`).
 
 - **Match found:** The new document is discarded. The existing candidate's `occurrence_count` and `source_sessions` are updated with the current session.
 - **No match:** A new candidate is stored.
-
-This step replaces the old brittle BM25 keyword-matching approach, which failed when the same question was asked with slightly different wording.
 
 **Step B4 — Store as Candidate**
 
@@ -187,6 +199,7 @@ The synthesised document is stored in `candidate_collection` with:
 - `status: "candidate"`
 - `occurrence_count: 1`
 - `source_sessions: [current_session_id]`
+- `created_at: UTC timestamp` (used for stale candidate cleanup)
 
 ---
 
@@ -215,20 +228,31 @@ This provides a vital secondary defense layer, ensuring the user is served a saf
 
 When the Smart Router classifies a query as `CONFLICT`, the pipeline takes a special route that bypasses the candidate consensus queue entirely.
 
-**Scenario A — Web Evidence Found & Critic Passes (`_conflict_replace`):**
+**Step C1 — LLM Conflict Judge (Agreement Check)**
+
+Before replacing anything, the system invokes a dedicated LLM judge using `CONFLICT_JUDGE_PROMPT`. This prompt sends both the original active document and the web-synthesized document to the LLM alongside the user's dispute query, and asks a single deterministic question: **does the web evidence AGREE or DISAGREE with the original on the specific disputed point?**
+
+- **Verdict: `AGREES`** — The web evidence **confirms** the original document is correct. The user's dispute was wrong. The original document remains `active` and untouched. The dispute is logged as `reason: "web_confirmed_original"` in the document's `unverified_disputes` metadata field.
+- **Verdict: `DISAGREES`** — The web evidence **contradicts** the original. Proceed to replacement.
+
+> **Why an LLM judge instead of cosine similarity?** Cosine similarity measures topical overlap, not factual agreement. Two documents about the same topic — one saying "Python was created in 1991" and one saying "Python was created in 1995" — would score very high on cosine similarity despite containing contradictory facts. The LLM judge can detect these semantic-level disagreements that vector distance cannot.
+
+**Scenario A — Web Evidence Contradicts Original & Critic Passes (`_conflict_replace`):**
 
 1. The poisoned active document is immediately updated with `status: "poisoned"`.
 2. A full forensic trail is embedded in its metadata: who disputed it, when, the exact dispute query, and a 500-character snapshot of the original content.
-3. A new document, built from verified web sources, is inserted as `status: "active"` with a `parent_id` linking back to the poisoned entry.
-4. The user gets the corrected answer immediately. No consensus delay.
+3. **Orphan Pruning:** All candidate nodes in `candidate_collection` that reference the poisoned document as their `original_id` are immediately deleted, preventing "toxic lineage promotion" where candidates derived from corrupted data could later be promoted.
+4. A new document, built from verified web sources, is inserted as `status: "active"` with a `parent_id` linking back to the poisoned entry.
+5. The user gets the corrected answer immediately. No consensus delay.
 
-**Scenario B — Web Search Fails or Critic Rejects (`_quarantine_document`):**
+**Scenario B — Web Search Fails or Critic Rejects (`_log_unverified_dispute`):**
 
-If the web cannot provide grounded evidence to confirm or deny the disputed fact:
-1. The disputed active document is updated with `status: "disputed"`.
-2. Its `quarantine_reason` metadata records why (e.g. `"no_web_evidence"`, `"synthesis_rejected"`).
-3. The document is immediately invisible to all future queries (the active collection filter only serves `status: "active"`).
-4. The user is informed that no reliable information could be found.
+If the web cannot provide grounded evidence to confirm or deny the disputed fact (no web results, synthesis failure, or Critic rejection):
+1. The dispute is **logged** in the original document's `unverified_disputes` metadata field (recording the session ID, dispute query, timestamp, and failure reason).
+2. The original document **remains `active`** and continues being served to users.
+3. The user is informed: *"I couldn't find reliable information on this topic."*
+
+This design follows an **"Innocent Until Proven Guilty" doctrine**: an active document that was built through consensus is never quarantined based solely on an unverified dispute. This prevents **Denial-of-Service / Censorship attacks** where a malicious actor could mass-dispute valid documents, exploiting web search failures to wipe the active database.
 
 ---
 
@@ -245,23 +269,27 @@ A candidate document must meet **all four** of the following conditions to be pr
 
 For **web candidates** (Path B), only `occurrence_count`, `distinct_sessions`, and `score` apply (there is no original document to compute similarity against).
 
-When the final confirming session arrives:
-1. The candidate is promoted and removed from `candidate_collection`.
-2. The new active document is inserted with full provenance metadata.
-3. If the candidate was created via a `CONFLICT` or `VOLATILE` reroute, the `parent_id` is used to archive the old active document.
-
 ---
 
 ## 6. Promotion to Active
 
-On promotion, the pipeline:
+On promotion, the pipeline executes a strict three-phase atomic transition:
 
-1. Checks if a `parent_id` exists on the candidate (i.e., this knowledge is a correction/update of an older document).
-2. If yes, the parent is updated to `status: "archived"`.
-3. The new document is added to `active_collection` with `status: "active"` and provenance fields like `promoted_from_candidate`, `promoted_at`, and `parent_id`.
-4. The candidate is deleted from `candidate_collection`.
+**Phase 1 — Archive the original:**
+1. Checks if a `parent_id` exists on the candidate.
+2. If yes, retrieves the original document's metadata and checks its current status.
+3. If the original is already `status: "poisoned"`, archival is **skipped** to preserve the forensic trail (prevents overwriting poisoning metadata with a generic "archived" tag).
+4. Otherwise, the parent is updated to `status: "archived"`.
+5. If no `parent_id` exists (e.g., corrupted candidate), the system promotes without archival and logs a warning.
 
-For web candidates specifically, the pipeline runs one final LLM refinement pass on the candidate before promoting it, using the standalone `refiner.py` module and `REFINE_DOCUMENT_PROMPT`. This is a separate refinement step from the Smart Router's `CONFIRM_AND_REFINE_PROMPT` — it takes the confirming user's query and integrates it into the candidate document for a cleaner final product. If the refinement degrades quality below `REJECTION_THRESHOLD`, it falls back to the raw candidate text.
+**Phase 2 — Insert the promoted document:**
+1. A new UUID is generated for the promoted document.
+2. The document is added to `active_collection` with `status: "active"` and full provenance metadata: `promoted_from_candidate`, `promoted_at`, `parent_id`, and `topic`.
+
+**Phase 3 — Delete the candidate:**
+1. The candidate record is permanently deleted from `candidate_collection`.
+
+For web candidates specifically, the pipeline runs one final LLM refinement pass on the candidate before promoting it, using the standalone `refiner.py` module and `REFINE_DOCUMENT_PROMPT`. If the refinement degrades quality below `REJECTION_THRESHOLD`, it falls back to the raw candidate text. Additionally, the system uses `EXTRACT_TOPIC_PROMPT` to generate a clean, canonical topic name from the document content instead of using the raw user query as the topic label.
 
 ---
 
@@ -311,11 +339,14 @@ Beyond the tunable thresholds in `thresholds.json`, `config.py` defines:
 │  ┌─────────────────────────────────────────────┐   │
 │  │ User disputes a fact (CONFLICT routing)     │   │
 │  │                                             │   │
-│  │   Web confirms correction                   │   │
+│  │   Web CONTRADICTS original                  │   │
 │  │     → status: "poisoned"  (forensic archive)│   │
 │  │                                             │   │
-│  │   Web cannot confirm correction             │   │
-│  │     → status: "disputed"  (quarantine)      │   │
+│  │   Web CONFIRMS original                     │   │
+│  │     → stays "active" (dispute logged)       │   │
+│  │                                             │   │
+│  │   Web search fails / Critic rejects         │   │
+│  │     → stays "active" (dispute logged)       │   │
 │  └─────────────────────────────────────────────┘   │
 │                                                     │
 │  Superseded by newer version (normal promotion)     │
@@ -330,7 +361,6 @@ Beyond the tunable thresholds in `thresholds.json`, `config.py` defines:
 | `active` | ✅ Yes | Current source of truth for this topic |
 | `candidate` | ❌ No | Unconfirmed — awaiting consensus |
 | `archived` | ❌ No | Superseded by a newer, better version |
-| `disputed` | ❌ No | Under dispute, web could not resolve — quarantined |
 | `poisoned` | ❌ No | Confirmed bad — web correction applied, preserved for forensics |
 
 ---
@@ -341,7 +371,7 @@ All thresholds live in `src/thresholds.json` and are loaded at startup via `conf
 
 | Threshold | Value | Description |
 |---|---|---|
-| `RELEVANCE_THRESHOLD` | 0.4 | Minimum query-to-doc cosine similarity to trigger Path A |
+| `RELEVANCE_THRESHOLD` | 0.50 | Minimum query-to-doc cosine similarity to trigger Path A |
 | `REJECTION_THRESHOLD` | 0.70 | Minimum Critic score for a document to proceed |
 | `PROMOTION_SCORE_THRESHOLD` | 0.80 | Minimum best Critic score across all confirmations for promotion |
 | `PROMOTION_SIMILARITY_THRESHOLD` | 0.80 | Minimum cosine similarity to original for Path A promotion |
@@ -349,9 +379,11 @@ All thresholds live in `src/thresholds.json` and are loaded at startup via `conf
 | `PROMOTION_SESSION_THRESHOLD` | 2 | Minimum distinct sessions for promotion |
 | `CANDIDATE_MATCH_THRESHOLD` | 0.70 | Gate 1: overall doc similarity to group Path A candidates |
 | `DELTA_MATCH_THRESHOLD` | 0.70 | Gate 2: change-direction similarity to group Path A candidates |
-| `WEB_CANDIDATE_MATCH_THRESHOLD` | 0.85 | Cosine similarity threshold to match Path B candidates |
+| `WEB_CANDIDATE_MATCH_THRESHOLD` | 0.85 | Cosine similarity threshold to match Path B candidates and active pool deduplication |
 | `IDENTICAL_REFINEMENT_THRESHOLD` | 0.99 | If refined doc is this close to original, discard (nothing changed) |
-| `BM25_QUERY_THRESHOLD` | 0.85 | Legacy BM25 query threshold (no longer used in routing) |
+| `MAX_CLAIMS_TO_CHECK` | 3 | Maximum claims extracted per document for grounding |
+| `MIN_SEARCH_RESULTS` | 2 | Minimum sources required for a claim to be considered grounded |
+| `CANDIDATE_MAX_AGE_DAYS` | 30 | Candidates older than this are pruned by `cleanup_stale_candidates()` |
 
 ---
 
@@ -360,10 +392,12 @@ All thresholds live in `src/thresholds.json` and are loaded at startup via `conf
 | Command | Description |
 |---|---|
 | `seed` | Loads the 10 starter seed documents into the active collection (skips if already populated) |
+| `reseed` | Force re-seed — adds starter documents even if the database is non-empty |
 | `status` | Displays the total count of active and candidate documents |
 | `docs` | Lists all active documents with ID, topic, and a 120-character text preview |
 | `candidates` | Lists all candidate documents in the pool with detailed confirmation, session progress, parent links, and text previews |
-| `forensics` | Scans the active collection for all `poisoned` and `disputed` documents with full forensic metadata |
+| `forensics` | Scans for all `poisoned` documents, `disputed` documents, and active documents with `unverified_disputes` logged |
+| `cleanup` | Removes stale candidates older than `CANDIDATE_MAX_AGE_DAYS` (30 days) that never reached consensus |
 | `admin` | Enters the interactive admin surgery panel (see below) |
 | `full` | Displays the complete document returned by the last query |
 | `help` | Shows the command reference |
@@ -408,12 +442,12 @@ For each **`poisoned`** document found, the system displays:
 - `dispute_query` — the exact query the user typed that triggered the conflict detection
 - `original_content` — a 500-character snapshot of the original text at the time of poisoning
 
-For each **`disputed`** document found, the system displays:
+For **active documents with unverified disputes**, the system scans all `"active"` documents for the `unverified_disputes` metadata field and displays each logged dispute with:
 - Document ID, topic, and text preview
-- `disputed_at` — exact UTC timestamp
+- `disputed_at` — UTC timestamp of the dispute attempt
 - `disputed_by` — the session ID that raised the dispute
 - `dispute_query` — the triggering query
-- `quarantine_reason` — why the document could not be corrected (`"no_web_evidence"`, `"synthesis_failed"`, or `"synthesis_rejected"`)
+- `reason` — why the dispute was not verified (`"no_web_evidence"`, `"synthesis_failed"`, `"synthesis_rejected"`, or `"web_confirmed_original"`)
 
 This enables full traceability: given any poisoned entry, you can follow the chain:
 ```
@@ -456,7 +490,7 @@ poisoned active doc
   - Archives the bad active document as `status: "poisoned"` with a full forensic trail in its metadata.
   - Inserts the web-verified corrected document as a new `status: "active"` entry.
   - No candidate queue. No waiting for a second session. One dispute = one correction.
-- **Added: `_quarantine_document()`** — When a `CONFLICT` is detected but the web cannot provide grounded evidence (no results, synthesis failure, or Critic rejection), the disputed document is set to `status: "disputed"` and immediately stops being served.
+- **Added: `_quarantine_document()`** — (Later replaced in v1.0) When a `CONFLICT` is detected but the web cannot provide grounded evidence, the disputed document was quarantined.
 - **Fixed:** The `_web_search_path()` function now accepts a `routing` parameter. When `routing == "CONFLICT"`, the conflict fast-path is activated.
 
 ### v0.6 — Forensics Engine
@@ -482,3 +516,25 @@ poisoned active doc
 - **Fix:** Introduced the **`INSUFFICIENT`** routing bucket. When the router detects that the query domain matches the document but lacks the specific details required to answer, it routes to Path B with a `parent_id`. This allows the web-synthesis engine to fetch the missing details, create a candidate, and eventually merge/enrich the active document via the consensus path.
 - **Added:** The `candidates` command to the main CLI. This gives administrators clear visibility into what unproven knowledge is currently sitting in the staging area, showing occurrence counts, session confirmations, parent IDs, and mutation scores.
 
+### v1.0 — Dispute DoS Protection & Active Pool Deduplication
+- **Problem (Censorship Attack):** The old `_quarantine_document()` function changed a disputed document's status from `"active"` to `"disputed"` whenever a CONFLICT dispute failed web verification. An attacker could exploit this by mass-disputing valid documents with queries designed to fail web search, effectively wiping the entire active database.
+- **Fix:** Replaced `_quarantine_document()` with `_log_unverified_dispute()`. When a dispute cannot be verified by web search, the document's status **remains `"active"`**. The dispute details (session, query, timestamp, reason) are appended to an `unverified_disputes` JSON array in the document's metadata. This implements an **"Innocent Until Proven Guilty"** doctrine.
+- **Problem (Active Pool Duplication):** Path B only checked the candidate pool for duplicates before storing a new candidate. If a query barely missed the relevance threshold and routed to Path B, the web search could return knowledge identical to an existing active document, creating a duplicate.
+- **Fix:** Added **Step B3.4 — Active Pool Deduplication**. Before checking the candidate pool, Path B now queries the active collection. If the synthesized document has cosine similarity ≥ 0.85 with an existing active document, it is discarded entirely.
+- **Changed:** `RELEVANCE_THRESHOLD` raised from `0.40` to `0.50` to reduce false Path A routing (queries that barely match but aren't truly relevant, forcing unnecessary Smart Router LLM calls).
+- **Updated:** The `forensics` CLI command now also scans active documents for the `unverified_disputes` metadata field, displaying them as `ACTIVE (Dispute Logged)` entries.
+
+### v1.1 — Conflict Agreement Check (False Poisoning Prevention)
+- **Problem:** When a user disputed a correct fact (e.g. *"the internet is not a global network"*), the web search returned evidence confirming the original document was correct. But the Conflict Fast-Path replaced the original anyway, marking it as `"poisoned"` — even though the web agreed with it. This destroyed provenance, polluted forensic logs with false positives, and discarded accumulated refinements.
+- **Initial Fix:** Added a cosine similarity agreement check between the web synthesis and original. However, cosine similarity measures topical overlap, not factual agreement — two documents about the same topic with contradictory facts still score high.
+- **Final Fix:** Replaced the cosine-based check with an **LLM Conflict Judge** (`CONFLICT_JUDGE_PROMPT`). The judge receives both documents and the dispute query, and returns a single-word verdict: `AGREES` or `DISAGREES`. If the web evidence agrees with the original, the dispute is logged as `reason: "web_confirmed_original"` and the original remains active.
+
+### v1.2 — Hardening Fixes & Stale Candidate Cleanup
+- **Added: Orphan Pruning** — When `_conflict_replace()` poisons a document, all candidate nodes in `candidate_collection` referencing that document via `original_id` are immediately deleted, preventing toxic lineage promotion.
+- **Added: Poisoned Forensic Guard** — `_promote()` now checks if the original document's status is already `"poisoned"` before archiving. If it is, archival is skipped to preserve the forensic metadata trail.
+- **Added: Null `original_id` Guard** — `_promote()` handles candidates with missing `original_id` (corrupted candidates) gracefully, promoting without archival and logging a warning.
+- **Added: `cleanup` CLI Command** — Runs `cleanup_stale_candidates()` which removes candidates older than `CANDIDATE_MAX_AGE_DAYS` (30 days) that never accumulated consensus.
+- **Added: `created_at` Timestamp** — All new candidates (both Path A and Path B) now store a `created_at` UTC timestamp in their metadata, enabling temporal stale pruning.
+- **Added: `reseed` CLI Command** — Force re-seeds the database with starter documents even when data already exists.
+- **Added: LLM Topic Extraction** — Web candidate promotion now uses `EXTRACT_TOPIC_PROMPT` to generate a clean, canonical topic name from document content instead of using the raw user query as the topic label.
+- **Fixed: Active Pool Dedup Skip** — Path B's active pool deduplication check is now skipped for rerouted queries with a `parent_id` (VOLATILE/INSUFFICIENT). The enriched document would naturally match its parent and be incorrectly discarded as a duplicate.

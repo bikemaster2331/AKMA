@@ -185,7 +185,9 @@ def search_web(query: str) -> list[dict]:
             search_depth="basic",
             max_results=5,
             exclude_domains=BLOCKED_DOMAINS,
-            include_domains=TRUSTED_DOMAINS if TRUSTED_DOMAINS else None,
+            # No include_domains here — cast a wide net for discovery.
+            # include_domains is an allowlist, not a boost, so using it
+            # blocks all non-technical topics from returning results.
         )
     except Exception as e:
         print(f"  [SEARCH] Error searching web: {e}")
