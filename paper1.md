@@ -2,42 +2,61 @@
 
 ---
 
+## \subsubsection{Conflict Fast-Path and Self-Healing}
+
+When a user explicitly disputes a stored fact, AKMA activates a Conflict Fast-Path that bypasses the normal multi-session consensus queue and attempts immediate web arbitration. The objective is to neutralise provably poisoned entries quickly while preserving a complete forensic trail.
+
+- \textbf{LLM Conflict Judge:} The system synthesises web evidence for the disputed query and invokes a deterministic LLM judge (\texttt{CONFLICT\_JUDGE\_PROMPT}) that compares the original active document and the web-synthesised document. The judge answers whether the web evidence \textbf{AGREES} or \textbf{DISAGREES} with the original on the specific disputed point.
+- \textbf{Immediate Replacement (DISAGREES):} If the judge finds that the web evidence contradicts the active document, the pipeline executes an immediate replacement via \texttt{_conflict\_replace()}:
+    - The original active document is updated to \texttt{status: "poisoned"} with a forensic payload (\texttt{poisoned\_at}, \texttt{disputed\_by}, \texttt{dispute\_query}, and a snapshot \texttt{original\_content}).
+    - Any candidate nodes that reference the poisoned entry as their \texttt{original\_id} are pruned (orphan cleanup) to prevent toxic lineage promotion.
+    - A corrected document, synthesised from web evidence and scored by the Critic, is inserted immediately as a new \texttt{status: "active"} entry with provenance metadata (\texttt{corrected\_at}, \texttt{corrected\_by}, \texttt{parent\_id}).
+
+- \textbf{Confirmed Original (AGREES):} If the judge finds the web evidence supports the original, the original document remains \texttt{active} and the dispute is recorded in the document's \texttt{unverified\_disputes} metadata (reason: \texttt{"web\_confirmed\_original"}). The user still receives the web-synthesised explanation, but no archival or promotion occurs.
+
+- \textbf{Unverified Disputes and DoS Protection:} If web search fails, synthesis fails, or the Critic rejects the correction, the dispute is logged (\texttt{_log\_unverified\_dispute()}) and the original remains \texttt{active}. This "innocent-until-proven-guilty" behaviour prevents an attacker from mass-disputing valid documents to induce censorship or denial-of-service on the active pool.
+
+Together, these steps provide fast, auditable remediation: provably-bad entries are replaced immediately and preserved for forensic analysis, while unverifiable disputes are captured without disabling normal service.
+
+---
+
 ## \subsubsection{Atomic Promotion and Knowledge Persistence}
 
-When all consensus promotion requirements are satisfied, the system executes a structured, three-phase transition to transfer the validated knowledge from the staging area to the active production pool. These three operations are performed in strict sequential order, ensuring that the knowledge base never exists in a partially-updated or inconsistent state.
+When a candidate satisfies the consensus gates it enters a strictly atomic promotion sequence designed to preserve provenance and prevent partial state transitions. The system performs three atomic phases:
 
-In the first phase, the system retrieves the metadata of the parent document from \texttt{active\_nodes} and updates its \texttt{status} field to \texttt{"archived"}. This preserves the document's full text and provenance within the active collection but renders it permanently invisible to all future user queries, which are filtered exclusively on \texttt{status = "active"}. 
+1. \textbf{Archive the original:} If the candidate references a parent (`parent_id`), the parent is retrieved and its metadata updated to \texttt{status: "archived"} (unless it is already \texttt{poisoned}, in which case archival is skipped to preserve forensic metadata). Archival preserves the full text and provenance but removes the document from normal serving.
 
-Critically, the document is never physically deleted from the database; it is retained as an immutable historical record. This structural decision serves three vital functions:
-\begin{enumerate}
-    \item \textbf{Lineage Continuity:} If parent documents were physically purged, the \texttt{parent\_id} references of all subsequent mutations would become dangling pointers, breaking the historical chain of custody and making it impossible to map the epistemic trajectory of a topic back to its seed source.
-    \item \textbf{Forensic Auditability:} Retaining historical states allows administrators to conduct forensic post-mortems of the database. It exposes slow-boil semantic drift attacks or coordinated poisoning campaigns that are only visible when analyzing document evolution over many iterations.
-    \item \textbf{Instant Metadata Rollback:} Preserving the prior state allows for zero-loss recovery. If a flawed mutation or malicious candidate bypasses the consensus gate and gets promoted, administrators can instantly restore the system to its pre-compromised state by toggling the metadata \texttt{status} of the archived parent back to \texttt{"active"}, avoiding the need for expensive vector reconstructions or manual text restoration.
-\end{enumerate}
+2. \textbf{Insert the promoted document:} A new UUID is generated and the promoted document is added to the \texttt{active\_nodes} collection with \texttt{status: "active"} and rich provenance fields: \texttt{promoted\_from\_candidate}, \texttt{promoted\_at} (UTC), \texttt{parent\_id}, \texttt{topic}, and scoring metadata.
 
-In the second phase, the system generates a new globally unique identifier (UUID) and inserts the promoted candidate document as a fresh entry in \texttt{active\_nodes} with \texttt{status = "active"}. Along with the document text and its newly generated embedding vector, the system stores a rich provenance payload in the document's metadata, including \texttt{promoted\_from\_candidate} (linking to the deleted candidate record), \texttt{promoted\_at} (the UTC timestamp of the promotion event), \texttt{parent\_id} (linking to the archived predecessor), and the topic classification inherited from the parent document.
+3. \textbf{Delete the candidate:} The promoted candidate is deleted from \texttt{candidate\_nodes}, removing it from the staging pool and preventing double-promotion.
 
-In the third and final phase, the candidate record is permanently deleted from \texttt{candidate\_nodes}, releasing its storage and removing it from the active staging pool.
+This three-phase process enforces an \textbf{append-only mutation history}: every promotion produces a new, independently addressable node and the full evolution of any knowledge item can be reconstructed by following the \texttt{parent\_id} chain.
 
-This three-phase architecture enforces a strictly \textbf{append-only mutation history}. Since the original document is archived rather than overwritten, and the promoted document is inserted as a new record rather than replacing the original in-place, every state transition in the knowledge base produces a new, independently addressable document node. The full evolution of any knowledge node — from its initial seed entry, through every archived predecessor, to its current active state — can be reconstructed by traversing the \texttt{parent\_id} chain. This provides complete, tamper-evident lineage for administrative auditing, forensic analysis, and rollback procedures.
+Final verification at promotion time: before committing the new active node, the system performs a fresh, targeted web verification of the candidate to ensure evidence freshness. If a parent exists the system extracts the delta (new claims only) and verifies those claims against the live web; if no parent exists it grounds the entire candidate document. Any unverified claim blocks promotion. This re-check protects against stale or incomplete synthesis even for candidates originally produced from Tavily.
+
+Edge cases and safeguards:
+- If the candidate contains no \texttt{original\_id} (corrupted or orphaned candidate), the system can promote without archival while logging a warning and reduced provenance.
+- If the parent has \texttt{status: "poisoned"}, archival is skipped to preserve forensic traces.
 
 ---
 
 ## \subsubsection{Response Delivery and Knowledge State Resolution}
 
-The AKMA pipeline resolves each user query into exactly one of four possible response states, each reflecting the system's current knowledge confidence level for the queried topic. The governing function \texttt{run\_akm()} returns a document object that is subsequently passed to the Summary Layer for conversational formatting.
+AKMA resolves each user query into one of four response states; which state is returned depends on routing, Critic scoring, immediate verification, and whether a promotion occurred:
 
 \begin{enumerate}
-    \item \textbf{Original Node Fallback:} If the retrieved active document is relevant but the Smart Router determines the query adds no new information, or if the Critic rejects the produced refinement, the original active document is returned unchanged. The Summary Layer then generates a grounded, 2-to-3 sentence answer derived exclusively from the unmodified document. This state prioritises stability: the system provides a reliable, validated answer rather than exposing the user to a potentially degraded or hallucinated refinement.
+        \item \textbf{Original Node Fallback:} When the Smart Router finds the active document relevant but the refinement fails (low Critic score), or an immediate delta check fails, the system returns the original active document. The Summary Layer then produces a grounded 2–3 sentence answer strictly from that document.
 
-    \item \textbf{Validated Refinement Delivery:} If the Smart Router classifies the query as \texttt{STATIC\_MATCH} and the Critic approves the refinement (score $\ge 0.70$), the refined document is returned. The candidate pipeline runs in parallel — the refinement is staged as a candidate without delaying the user's response. The user receives the most up-to-date, contextually enriched version of the knowledge immediately, while the system asynchronously processes the mutation's eligibility for permanent promotion.
+        \item \textbf{Validated Refinement Delivery:} If the Smart Router classifies the query as \texttt{STATIC\_MATCH}, the Critic approves the refinement, and the immediate delta verification (if any new claims were added) passes, the refined document is returned immediately to the user. The refinement is also staged as a candidate for later consensus — the user sees the up-to-date version while the system asynchronously processes promotion eligibility.
 
-    \item \textbf{Promoted Mutation Delivery:} If the incoming refinement or web synthesis triggers promotion (all consensus thresholds satisfied), the newly promoted document is the authoritative knowledge baseline for this response. The user's query directly precipitated the finalization of a multi-session consensus cycle, and the promoted document is returned and simultaneously committed to the active knowledge base.
+        \item \textbf{Promoted Mutation Delivery:} When a candidate completes the consensus gates and the final lazy verification at promotion time succeeds, the promoted document becomes the authoritative active node and is returned as the response.
 
-    \item \textbf{Graceful Failure:} If no relevant document exists (Path B) and the web search returns no usable sources, or if the Critic rejects all synthesized documents, the pipeline returns a structured refusal. The user receives a clearly communicated message stating that the system could not locate reliable information on the requested topic. No LLM-generated speculation or parametric knowledge is inserted as a substitute.
+        \item \textbf{Graceful Failure:} If no relevant active document exists and Path B web synthesis fails (no sources, synthesis rejected), the system returns a structured refusal indicating that reliable information could not be found. No speculative content is promoted.
 \end{enumerate}
 
-In all four states, the final output passes through the Summary Layer governed by \texttt{SUMMARIZE\_FOR\_QUERY\_PROMPT}, which strictly constrains the language model to answer exclusively from the provided document. This constraint functions as the system's final fail-safe against hallucination at the user-facing output boundary.
+	extbf{Summary Layer and grounding fail-safe:} Every response is post-processed by the Summary Layer using \texttt{SUMMARIZE\_FOR\_QUERY\_PROMPT}, which constrains the LLM to answer using only the provided document. This final gate prevents user-facing hallucination: when evidence is absent or insufficient the model returns a refusal rather than inventing facts.
+
+Operational note: the immediate delta verification executed during Path A is a fail-closed gate — if extraction/search/judgement fails or returns unverified claims, the refinement is rejected and the original document is returned. The lazy verification at promotion time is similarly conservative: any unverified claim blocks promotion. These layered checks balance responsiveness for single users with rigorous safety for the shared active store.
 
 ---
 

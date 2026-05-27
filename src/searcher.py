@@ -1,5 +1,6 @@
 from tavily import TavilyClient
 from groq import Groq
+from telemetry import record_groq_usage, log_telemetry
 from config import (
     TAVILY_API_KEY,
     GROQ_API_KEY,
@@ -8,7 +9,7 @@ from config import (
     MAX_CLAIMS_TO_CHECK,
     MIN_SEARCH_RESULTS,
 )
-from prompts import EXTRACT_CLAIMS_PROMPT, SYNTHESIZE_FROM_SEARCH_PROMPT
+from prompts import EXTRACT_CLAIMS_PROMPT, SYNTHESIZE_FROM_SEARCH_PROMPT, EXTRACT_DELTA_CLAIMS_PROMPT, VERIFY_CLAIM_PROMPT
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 groq   = Groq(api_key=GROQ_API_KEY)
@@ -31,6 +32,12 @@ def extract_claims(document: str) -> list[str]:
         max_tokens=200,
         temperature=0
     )
+
+    # Record token usage if available
+    try:
+        record_groq_usage(response, "extract_claims")
+    except Exception:
+        pass
 
     raw = response.choices[0].message.content.strip()
 
@@ -173,6 +180,148 @@ def ground_document(document: str) -> dict:
     }
 
 
+
+def extract_delta_claims(original: str, refined: str) -> dict:
+    """
+    Uses the LLM to extract ONLY the new factual claims that were added
+    in the refinement — ignoring facts already present in the original.
+
+    Returns a dict with:
+      - "claims": up to MAX_CLAIMS_TO_CHECK claim strings (to verify)
+      - "total": total number of extracted claims (may be > cap)
+    """
+
+    prompt = EXTRACT_DELTA_CLAIMS_PROMPT.format(
+        document_original=original,
+        document_refined=refined
+    )
+
+    response = groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
+        temperature=0
+    )
+
+    # Record token usage if available
+    try:
+        record_groq_usage(response, "extract_delta_claims")
+    except Exception:
+        pass
+
+    raw = response.choices[0].message.content.strip()
+
+    if "NONE" in raw.upper():
+        return {"claims": [], "total": 0}
+
+    all_claims = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line[0].isdigit():
+            parts = line.split(".", 1) if "." in line else line.split(")", 1)
+            if len(parts) == 2:
+                claim = parts[1].strip()
+                if claim:
+                    all_claims.append(claim)
+        else:
+            # Fallback: treat any non-empty line as a potential claim
+            all_claims.append(line)
+
+    total = len(all_claims)
+    claims = all_claims[:MAX_CLAIMS_TO_CHECK]
+    return {"claims": claims, "total": total}
+
+
+def ground_delta(original: str, refined: str) -> dict:
+    """
+    Lazy delta verification: extract only NEW claims from a refinement
+    and verify each one against web sources.
+
+    Returns:
+        {
+            "claims_checked": int,
+            "claims_grounded": int,
+            "claims_unverified": list[str],
+            "passed": bool
+        }
+    """
+
+    print(f"  [VERIFY] Extracting delta claims (new facts only)...")
+    res = extract_delta_claims(original, refined)
+    claims = res.get("claims", [])
+    total_claims = int(res.get("total", len(claims)))
+
+    if total_claims == 0:
+        print(f"  [VERIFY] No new verifiable claims found in delta. Passing.")
+        return {
+            "claims_checked": 0,
+            "claims_grounded": 0,
+            "claims_unverified": [],
+            "total_claims": 0,
+            "passed": True
+        }
+
+    print(f"  [VERIFY] Extracted {total_claims} total delta claim(s); verifying up to {len(claims)}:")
+    for c in claims:
+        print(f"           → {c}")
+
+    unverified = []
+    grounded_count = 0
+
+    for claim in claims:
+        print(f"  [VERIFY] Searching: \"{claim}\"")
+        result = search_claim(claim)
+        if result["grounded"]:
+            # Sources found — but do they actually CONFIRM the claim?
+            print(f"           Found {len(result['sources'])} source(s). Checking factual agreement...")
+            try:
+                judge_prompt = VERIFY_CLAIM_PROMPT.format(
+                    claim=claim,
+                    evidence=result["summary"][:2000]
+                )
+                judge_response = groq.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": judge_prompt}],
+                    max_tokens=10,
+                    temperature=0
+                )
+                # Record token usage for judgement
+                try:
+                    record_groq_usage(judge_response, "ground_delta_judge")
+                except Exception:
+                    pass
+                verdict = judge_response.choices[0].message.content.strip().upper()
+                if "CONFIRMED" in verdict:
+                    grounded_count += 1
+                    print(f"           ✓ CONFIRMED by web sources")
+                else:
+                    unverified.append(claim)
+                    print(f"           ✗ DENIED by web sources — claim contradicts evidence")
+            except Exception as e:
+                print(f"           ⚠ Judge error: {e}. Treating as unverified.")
+                unverified.append(claim)
+        else:
+            unverified.append(claim)
+            print(f"           ✗ Unverified — insufficient web evidence")
+
+    # If we parsed more claims than we verified, treat the delta as unverified
+    truncated = total_claims > len(claims)
+    if truncated:
+        unverified.append(f"{total_claims - len(claims)} additional claim(s) were detected but not checked (MAX_CLAIMS_TO_CHECK={MAX_CLAIMS_TO_CHECK}).")
+
+    passed = (len(unverified) == 0) and (not truncated)
+
+    return {
+        "claims_checked": len(claims),
+        "claims_grounded": grounded_count,
+        "claims_unverified": unverified,
+        "total_claims": total_claims,
+        "passed": passed
+    }
+
+
 def search_web(query: str) -> list[dict]:
     """
     Searches Tavily for a general query.
@@ -207,6 +356,12 @@ def search_web(query: str) -> list[dict]:
         for r in clean_results
     ]
 
+    # Log number of search results (best-effort)
+    try:
+        log_telemetry("tavily_search", {"query": query, "results": len(sources)})
+    except Exception:
+        pass
+
     return sources
 
 
@@ -234,5 +389,11 @@ def synthesize_from_search(user_query: str, search_results: list[dict]) -> str:
         max_tokens=1000,
         temperature=0
     )
+
+    # Record token usage if available
+    try:
+        record_groq_usage(response, "synthesize_from_search")
+    except Exception:
+        pass
 
     return response.choices[0].message.content.strip()

@@ -8,7 +8,8 @@ from groq import Groq
 from database import active_collection, candidate_collection, get_embedding
 from refiner import refine_document
 from critic import score_mutation
-from searcher import search_claim, search_web, synthesize_from_search
+from searcher import search_claim, search_web, synthesize_from_search, ground_delta, ground_document
+from telemetry import record_groq_usage, log_telemetry
 from config import (
     GROQ_API_KEY,
     REJECTION_THRESHOLD,
@@ -49,10 +50,14 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     print(f"[AKM] Session : {session_id}")
     print(f"{'='*50}")
 
-    # ── Step 1: Retrieve closest active document ───────────────────────────────
+    # ── Step 1: Retrieve closest active document(s) — threshold-gated Top-K ─
+    TOP_K_ACTIVE = 4
+    MAX_FETCH = 10
+    SELECTION_THRESHOLD = 0.75
+
     results = active_collection.query(
         query_texts=[user_query],
-        n_results=1,
+        n_results=MAX_FETCH,
         where={"status": "active"},
         include=["documents", "metadatas", "embeddings", "distances"]
     )
@@ -67,18 +72,55 @@ def run_akm(user_query: str, session_id: str) -> tuple:
             msg = "No knowledge base entries found. Type 'seed' to add starter data."
         return msg, msg
 
-    doc_original   = results["documents"][0][0]
-    doc_id         = results["ids"][0][0]
-    original_embed = results["embeddings"][0][0]
+    docs = results["documents"][0]
+    ids = results["ids"][0]
+    embeds = results["embeddings"][0] if results.get("embeddings") and results["embeddings"][0] else [None] * len(docs)
+    metas = results["metadatas"][0] if results.get("metadatas") and results["metadatas"][0] else [{}] * len(docs)
 
-    query_embed    = get_embedding(user_query)
-    doc_similarity = cosine_similarity(query_embed, original_embed)
+    query_embed = get_embedding(user_query)
 
-    doc_meta = results["metadatas"][0][0] if results["metadatas"] and results["metadatas"][0] else {}
-    doc_topic = doc_meta.get("topic", "unknown")
-    print(f"[AKM] Retrieved     : {doc_id[:8]}... (Topic: {doc_topic})")
-    print(f"[AKM] Doc Snippet   : {doc_original[:80].strip()}...")
-    print(f"[AKM] Query-to-doc  : {doc_similarity:.4f} (threshold: {RELEVANCE_THRESHOLD})")
+    sims = []
+    for i, emb in enumerate(embeds):
+        sim = float(cosine_similarity(query_embed, emb)) if emb else 0.0
+        sims.append((i, sim))
+
+    # Filter to only those meeting the selection threshold
+    passed = [(i, s) for (i, s) in sims if s >= SELECTION_THRESHOLD]
+
+    if not passed:
+        print("[AKM] No active document passed the selection threshold — routing to PATH B (Web Search)")
+        doc_similarity = 0.0
+        doc_original = None
+        doc_id = None
+        original_embed = None
+        doc_meta = {}
+        doc_topic = "unknown"
+    else:
+        passed_sorted = sorted(passed, key=lambda x: x[1], reverse=True)
+        top_passed = passed_sorted[:TOP_K_ACTIVE]
+
+        if len(passed_sorted) > TOP_K_ACTIVE:
+            print(f"[AKM] {len(passed_sorted)} active documents passed threshold; using top {TOP_K_ACTIVE}.")
+        else:
+            print(f"[AKM] {len(top_passed)} active document(s) passed threshold; using best match.")
+
+        best_idx, best_sim = top_passed[0]
+        doc_original = docs[best_idx]
+        doc_id = ids[best_idx]
+        original_embed = embeds[best_idx]
+        doc_meta = metas[best_idx] if metas and len(metas) > best_idx else {}
+        doc_topic = doc_meta.get("topic", "unknown")
+
+        print(f"[AKM] Retrieved     : {doc_id[:8]}... (Topic: {doc_topic})")
+        print(f"[AKM] Doc Snippet   : {doc_original[:80].strip()}...")
+        print(f"[AKM] Query-to-doc  : {best_sim:.4f} (threshold: {SELECTION_THRESHOLD})")
+
+        if len(top_passed) > 1:
+            print("[AKM] Ambiguous matches (top candidates):")
+            for idx, sim in top_passed:
+                print(f"  - {ids[idx][:8]} (sim: {sim:.4f})")
+
+        doc_similarity = best_sim
 
     # ── Step 2: Route based on relevance ──────────────────────────────────────
     if doc_similarity < RELEVANCE_THRESHOLD:
@@ -115,6 +157,10 @@ def _confirm_and_refine(user_query: str, doc_original: str) -> dict:
             temperature=0.3
         )
         text = response.choices[0].message.content.strip()
+        try:
+            record_groq_usage(response, "confirm_and_refine")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[AKM] API error in confirm_and_refine: {e}")
         return {"routing": "STATIC_MATCH", "refined_text": "", "mutation_type": "none"}
@@ -192,6 +238,26 @@ def _refinement_path(
     if similarity_score > IDENTICAL_REFINEMENT_THRESHOLD:
         print(f"[AKM] Refinement added nothing new — returning original")
         return doc_original
+
+    # ── Immediate Delta Verification Gate ──────────────────────────────────
+    # Compare refined vs original to extract ONLY the new claims added by
+    # the user. If new facts are detected, trigger a web search for just
+    # those facts. If the search contradicts them, reject the refinement
+    # immediately — never serve unverified claims to the user.
+    print("[AKM] Running immediate delta verification on refinement...")
+    try:
+        delta_result = ground_delta(doc_original, doc_refined)
+        if not delta_result["passed"]:
+            print(f"[AKM] ✗ Refinement contains {len(delta_result['claims_unverified'])} unverified claim(s):")
+            for claim in delta_result["claims_unverified"]:
+                print(f"       → {claim}")
+            print("[AKM] Rejecting refinement — returning original document.")
+            return doc_original
+        print(f"[AKM] ✓ Delta verified ({delta_result['claims_grounded']}/{delta_result['claims_checked']} claims grounded).")
+    except Exception as e:
+        print(f"[AKM] ⚠ Delta verification error: {e}. Falling back to original.")
+        return doc_original
+    # ───────────────────────────────────────────────────────────────────────
 
     print(f"[AKM] Gate passed — storing as candidate...")
 
@@ -325,6 +391,10 @@ def _web_search_path(user_query: str, session_id: str, parent_id: str = None, ro
                         max_tokens=10,
                         temperature=0
                     )
+                    try:
+                        record_groq_usage(judge_response, "conflict_judge")
+                    except Exception:
+                        pass
                     verdict = judge_response.choices[0].message.content.strip().upper()
                     print(f"[AKM] Conflict Judge verdict: {verdict}")
 
@@ -522,10 +592,34 @@ def _promote(candidate_id: str, original_id: str, refined_text: str, similarity_
 
     print("[AKM] Meaningful change — archiving original, activating refined...")
     try:
-        original_meta = active_collection.get(ids=[original_id])["metadatas"][0]
+        original_result = active_collection.get(ids=[original_id], include=["documents", "metadatas"])
+        original_meta = original_result["metadatas"][0]
+        original_text = original_result["documents"][0] if original_result["documents"] else None
     except (IndexError, KeyError):
         print(f"[AKM] ⚠ Could not find original document {original_id}. Promoting without archival.")
         original_meta = {"topic": "unknown"}
+        original_text = None
+
+    # ── Lazy Delta Verification ────────────────────────────────────────────
+    # Before committing the promotion, extract ONLY the new claims added by
+    # the refinement and verify each one against web sources. If any new
+    # claim cannot be grounded, block promotion entirely.
+    if original_text:
+        print("[AKM] Running lazy delta verification before promotion...")
+        try:
+            delta_result = ground_delta(original_text, refined_text)
+            if not delta_result["passed"]:
+                print(f"[AKM] ✗ PROMOTION BLOCKED — {len(delta_result['claims_unverified'])} unverified claim(s):")
+                for claim in delta_result["claims_unverified"]:
+                    print(f"       → {claim}")
+                print("[AKM] Candidate remains in staging. Promotion denied.")
+                return original_text
+            else:
+                print(f"[AKM] ✓ Delta verification passed ({delta_result['claims_grounded']}/{delta_result['claims_checked']} claims grounded).")
+        except Exception as e:
+            print(f"[AKM] ⚠ Delta verification ERROR: {e}. PROMOTION BLOCKED.")
+            print("[AKM] Candidate remains in staging. Promotion denied due to verifier error.")
+            return original_text
 
     # Fix 3: Guard against overwriting poisoned forensic metadata with "archived"
     current_status = original_meta.get("status", "active")
@@ -698,6 +792,58 @@ def _increment_web_candidate(
             print(f"[AKM] Refinement below threshold — promoting raw candidate")
             doc_to_store = matched_doc
 
+        # Promotion-time grounding for web-origin candidates (fail-closed)
+        parent_id = matched_meta.get("parent_id")
+        if parent_id:
+            print("[AKM] Running lazy delta verification for web candidate against parent...")
+            try:
+                parent_data = active_collection.get(ids=[parent_id], include=["documents"])
+                original_doc = parent_data["documents"][0] if parent_data and parent_data.get("documents") else None
+            except Exception as e:
+                original_doc = None
+                print(f"[AKM] Could not retrieve parent document for verification: {e}")
+
+            if original_doc:
+                try:
+                    delta_result = ground_delta(original_doc, doc_to_store)
+                    try:
+                        log_telemetry("web_candidate_lazy_delta", {"candidate_id": matched_id, "parent_id": parent_id, "delta_result": delta_result, "session_id": session_id, "query": user_query})
+                    except Exception:
+                        pass
+                    if not delta_result.get("passed", False):
+                        print(f"[AKM] ✗ PROMOTION BLOCKED — delta verification failed for web candidate.")
+                        return matched_doc
+                    else:
+                        print("[AKM] ✓ Web candidate delta verification passed.")
+                except Exception as e:
+                    try:
+                        log_telemetry("web_candidate_verify_error", {"candidate_id": matched_id, "error": str(e), "session_id": session_id})
+                    except Exception:
+                        pass
+                    print(f"[AKM] ⚠ Verification error: {e}. PROMOTION BLOCKED.")
+                    return matched_doc
+        else:
+            # Pure web-synthesized candidate: run full grounding before promotion
+            print("[AKM] Running full grounding for web candidate before promotion...")
+            try:
+                ground_result = ground_document(doc_to_store)
+                try:
+                    log_telemetry("web_candidate_ground_document", {"candidate_id": matched_id, "ground_result": ground_result, "session_id": session_id, "query": user_query})
+                except Exception:
+                    pass
+                if ground_result.get("claims_unverified"):
+                    print(f"[AKM] ✗ PROMOTION BLOCKED — {len(ground_result.get('claims_unverified', []))} unverified claim(s) in web grounding.")
+                    return matched_doc
+                else:
+                    print("[AKM] ✓ Web grounding passed.")
+            except Exception as e:
+                try:
+                    log_telemetry("web_candidate_ground_error", {"candidate_id": matched_id, "error": str(e), "session_id": session_id})
+                except Exception:
+                    pass
+                print(f"[AKM] ⚠ Grounding error: {e}. PROMOTION BLOCKED.")
+                return matched_doc
+
         # Fix 12: Extract a clean canonical topic via LLM instead of raw query
         topic = matched_meta.get("query", "unknown").replace(" ", "_")
         try:
@@ -707,6 +853,10 @@ def _increment_web_candidate(
                 max_tokens=10,
                 temperature=0
             )
+            try:
+                record_groq_usage(topic_resp, "extract_topic")
+            except Exception:
+                pass
             extracted = topic_resp.choices[0].message.content.strip().replace(" ", "_")
             if extracted and len(extracted) < 50:
                 topic = extracted
@@ -774,6 +924,10 @@ def summarize_for_query(user_query: str, document: str) -> str:
             max_tokens=150,
             temperature=0.3
         )
+        try:
+            record_groq_usage(response, "summarize_for_query")
+        except Exception:
+            pass
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"[AKM] Summary API error: {e}. Returning raw document.")

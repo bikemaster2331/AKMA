@@ -172,3 +172,31 @@ EXTRACT_TOPIC_PROMPT = """What is the main topic of this document in 1-3 words? 
 
 Document:
 {document}"""
+
+EXTRACT_DELTA_CLAIMS_PROMPT = """Compare these two documents and extract ONLY the new factual claims that appear in the REFINED document but NOT in the ORIGINAL document.
+
+Focus on specific, verifiable facts — names, dates, numbers, events, or causal claims that were ADDED by the refinement. Ignore any facts that already exist in the original, even if they are rephrased.
+
+ORIGINAL DOCUMENT:
+{document_original}
+
+REFINED DOCUMENT:
+{document_refined}
+
+If no new verifiable facts were added (only restructuring or rephrasing), return exactly: NONE
+
+Otherwise, return ONLY a numbered list of the new claims. No preamble, no explanation.
+Example format:
+1. Python was designed as a scripting tool for Amoeba OS
+2. Development started at CWI Amsterdam"""
+
+VERIFY_CLAIM_PROMPT = """A specific factual claim was searched on the web. Your job is to determine whether the search results CONFIRM or DENY this claim.
+
+CLAIM:
+{claim}
+
+SEARCH RESULTS:
+{evidence}
+
+Read the search results carefully. Do they support the specific claim above, or do they contradict it?
+Answer ONLY one word: CONFIRMED or DENIED"""

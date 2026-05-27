@@ -1,4 +1,4 @@
-# Part 2: Threat Model, Thresholds, Critic, Smart Router, Consensus, Evaluation, Limitations
+# Part 2: Threat Model, Thresholds, Critic, Smart Router, Consensus, , Limitations
 
 ---
 
@@ -98,20 +98,6 @@ This design has two key architectural consequences. First, the system is resista
 
 ---
 
-## \subsection{Evaluation Criteria}
-
-The following metrics define the measurable success criteria for the AKMA system across its core operational objectives:
-
-\begin{itemize}
-    \item \textbf{Hallucination Reduction Rate:} The percentage of LLM-generated document mutations that are rejected by the Critic before entering the candidate pool. A higher rejection rate at this gate indicates that the Critic's structural audit is effectively preventing contaminated knowledge from propagating.
-    \item \textbf{Mutation Precision:} The proportion of promoted candidates that represent genuinely novel, factually accurate knowledge additions, as measured by administrator spot-checks against ground-truth sources. High mutation precision indicates that the consensus threshold configuration is correctly filtering noise.
-    \item \textbf{Semantic Drift Resistance:} The average cosine distance between the initial seed embedding and the current active embedding for a given document node after $n$ promotion cycles. Low drift resistance indicates that the \texttt{PROMOTION\_SIMILARITY\_THRESHOLD} is too permissive.
-    \item \textbf{Promotion Accuracy:} The ratio of correctly promoted candidates (semantically valid, topically consistent mutations) to incorrectly promoted candidates (topic drift, hallucinated additions). This directly measures the effectiveness of the dual-gate candidate matching and the Critic's quality gates.
-    \item \textbf{Retrieval Consistency:} The variance in query-to-document similarity scores for semantically equivalent queries rephrased in different ways. Low variance indicates that the embedding model and cosine similarity routing are robustly capturing semantic intent across surface-level rephrasing.
-    \item \textbf{Consensus Reliability:} The proportion of candidates that, once promoted, are not subsequently disputed or reversed by conflict resolution. High consensus reliability indicates that multi-session confirmation is a reliable signal of factual quality.
-\end{itemize}
-
----
 
 ## \subsection{System Limitations}
 
@@ -128,3 +114,106 @@ Despite its multi-layered validation architecture, the AKMA system operates unde
 \textbf{Consensus Attack Possibilities:} While the session diversity rule prevents single-session flooding, a coordinated multi-account or multi-device attack can still satisfy the session diversity requirement by distributing false confirmations across multiple distinct sessions. The current implementation does not perform fingerprinting, behavioral analysis, or rate-limiting at the session level, leaving this attack vector partially open.
 
 \textbf{Scalability Constraints:} The active pool deduplication check in Path B (Step B3.4) performs a full cosine similarity query against all active documents on every Path B invocation. As the active knowledge base scales to tens of thousands of documents, this operation will introduce non-trivial query latency. The current architecture does not implement approximate nearest-neighbour indexing or query result caching for this deduplication step.
+
+---
+
+## \subsection{Evaluation Criteria}
+
+The Evaluation section must provide concise, reproducible evidence addressing three core questions: (1) does AKMA mutate knowledge correctly, (2) does it successfully block poisoning and hallucinations, and (3) what is the computational and latency cost of the added safety layers compared to a baseline? Below we provide the exact experimental structure, metric definitions, LaTeX table templates for results, and a rapid synthetic evaluation plan you can run locally.
+
+1) Experimental setup (the baseline)
+- The dataset: provide both an existing benchmark and a synthetic suite. Recommended bench: a mix of 500–1,000 queries drawn from HotpotQA / TriviaQA / FEVER (for multi-hop and factual coverage) plus a synthetic mutation corpus of N=200 seed documents with M=5 templated queries each.
+- The baseline: a standard Naive RAG pipeline (retrieve + LLM answer) with the same embedding and retriever but without the Critic, consensus, or web-judging layers. Report baseline numbers alongside AKMA.
+- Attack simulation: three adversarial testbeds:
+    - Hallucinated Refinements: inject K fabricated claims into otherwise-correct refinements (vary K ∈ {1,3,5}).
+    - Coordinated Poisoning: simulate S attacker sessions producing identical poisoned candidates across multiple simulated accounts (vary S and the number of distinct sessions to test session-diversity defenses).
+    - Dispute DoS: flood `CONFLICT` attempts that intentionally fail web lookup to validate `unverified_disputes` behaviour.
+
+2) Security & Robustness (proving the threat model)
+- Critic accuracy: measure how often the Critic rejects hallucinated/bad refinements (True Positive = hallucination correctly rejected). Report confusion matrix and precision/recall/F1.
+- Poison rejection: For Conflict/Dispute simulations, report (a) fraction of valid documents that survive (true-negatives), (b) fraction of poisoned documents that are replaced via the Conflict Fast-Path (true-positives), and (c) false-replacement rate (web-synthesis mistakenly replacing valid doc).
+
+LaTeX table template — Critic accuracy:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+	extbf{Condition} & \textbf{Total} & \textbf{Rejected} & \textbf{Precision} & \textbf{Recall} \\
+\hline
+Hallucinated refinements & 100 & 92 & 0.94 & 0.92 \\
+Benign refinements & 100 & 8 & 0.89 & 0.92 \\
+\end{tabular}
+\caption{Critic rejection results (example row format).}
+\end{table}
+
+LaTeX table template — Poison replacement:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+	extbf{Attack} & \textbf{Poisoned} & \textbf{Replaced} & \textbf{Survival} \\
+\hline
+Coordinated poisoning (S=3) & 50 & 46 & 92\% \\
+Dispute DoS & 100 & 0 (logged) & 100\% \\
+\end{tabular}
+\caption{Conflict Fast-Path replacement results (example format).}
+\end{table}
+
+3) Performance & overhead (the cost of consensus)
+- Latency impact: measure per-query latency distributions for Path A and Path B under baseline and AKMA. Report median, mean, and 95th percentile latency. Measure wall-clock from `run_akm()` entry to `summarize_for_query()` return.
+- Token / API overhead: report Groq (LLM) token and request counts per query broken down by component: Refiner, Critic, Judge, Topic-extraction, and Summary. Report average added tokens and API calls vs baseline.
+
+LaTeX table template — Performance:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+	extbf{Path} & \textbf{Median(s)} & \textbf{P95(s)} & \textbf{LLM calls} & \textbf{Extra tokens} \\
+\hline
+Baseline Path A & 0.8 & 1.6 & 1 & 1200 \\
+AKMA Path A (refine+critic) & 1.8 & 3.4 & 3 & 4200 \\
+Baseline Path B & 1.2 & 2.5 & 1 & 1400 \\
+AKMA Path B (synthesis+critic+judge) & 2.6 & 5.0 & 4 & 6200 \\
+\end{tabular}
+\caption{Latency and token overhead (example numbers).}
+\end{table}
+
+4) Knowledge evolution quality (the benefit)
+- Answer quality: use an independent LLM judge or small human panel to score answers on accuracy (binary), informativeness (0–5), and hallucination rate. Compare answers derived from (a) original active document, (b) single-session refinement (no promotion), and (c) promoted document. Report mean judge score and accuracy delta.
+- Promotion utility: measure how often promotions increase answer accuracy for subsequent queries (e.g., evaluate answers to held-out queries before and after promotion).
+
+LaTeX table template — Answer quality:
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+	extbf{Condition} & \textbf{Mean judge score} & \textbf{Accuracy (\%)} \\
+\hline
+Original active doc & 3.2 & 72 \\
+Refined (served) & 3.6 & 78 \\
+Promoted document & 4.1 & 86 \\
+\end{tabular}
+\caption{Answer quality comparison (example format).}
+\end{table}
+
+5) Statistical rigor
+- Run each experiment with multiple random seeds (≥5) and report mean ± standard error. For latency, report median and p95. Use bootstrap confidence intervals for judge-scored evaluation where sample sizes are modest.
+
+6) Rapid synthetic evaluation script (recommended)
+If you do not have benchmark data, the following rapid synthetic benchmark can be executed locally to produce the above tables in a few hours (assuming Groq/Tavily credentials are available):
+
+- Generate N=200 seed documents (short factual paragraphs) and M=5 templated queries each.
+- For each query, run `run_akm()` with a simulated session id (UUID). For attack tests, inject synthetic refinements that add random factual claims (some labelled as "poisoned").
+- Simulate multi-session confirmations by calling the same candidate with distinct session UUIDs.
+- Log for each query: timing (start/end), LLM calls and token usage (if available), route taken (Path A/B), Critic score, `ground_delta()` outputs, and promotion events.
+
+Minimal run command (script to implement as `scripts/evaluate_synthetic.py`):
+```bash
+python3 scripts/evaluate_synthetic.py \
+    --n_seeds 200 --queries_per_seed 5 \
+    --poison_rate 0.10 --attacks "hallucination,coordinated" \
+    --output results/eval_run_$(date +%s).json
+```
+
+If you want, I can implement the `scripts/evaluate_synthetic.py` harness next (it will support both online mode using Groq/Tavily and an offline mock mode for quick smoke tests). Running the full benchmark requires valid Groq and Tavily credentials in your environment.
+
+---
+
+Include these exact tables/figures in the paper's Evaluation section. When you have the data, paste the numeric CSV/JSON outputs into the `results/` folder and I can render the LaTeX tables and generate the suggested plots (latency CDFs, ROC for Critic, stacked bars for replacement outcomes) for inclusion in the paper.
+
