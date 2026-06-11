@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import time
 from datetime import datetime, timedelta
 from database import active_collection, candidate_collection, get_embedding
 from pipeline import run_akm
@@ -442,17 +443,7 @@ def _admin_document_view(selected: dict):
 
 
 def get_or_create_session_id() -> str:
-    """Persist session ID so the same machine reuses it across restarts."""
-    session_file = os.path.join(os.path.dirname(__file__), ".session_id")
-    if os.path.exists(session_file):
-        with open(session_file) as f:
-            sid = f.read().strip()
-            if sid:
-                return sid
-    sid = str(uuid.uuid4())
-    with open(session_file, "w") as f:
-        f.write(sid)
-    return sid
+    return str(uuid.uuid4())
 
 
 def main():
@@ -505,10 +496,14 @@ def main():
             else:
                 print("[AKM] No document stored yet. Ask a question first.\n")
         else:
+            start_t = time.perf_counter()
             short_answer, full_doc = run_akm(user_input, session_id)
+            elapsed = time.perf_counter() - start_t
+
             last_full_doc = full_doc
             print(f"\nResponse: {short_answer}")
             print(f"[Full document stored — type 'full' to view it.]\n")
+            print(f"[TIMING] Query took {elapsed:.3f}s")
 
 
 if __name__ == "__main__":

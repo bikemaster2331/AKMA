@@ -91,12 +91,13 @@ Every user query triggers this sequence:
 
 1. The query is embedded into a vector.
 2. ChromaDB performs a nearest-neighbour search across all **active** documents.
-3. Cosine similarity is computed between the query embedding and the retrieved document's embedding.
-4. The score is compared against `RELEVANCE_THRESHOLD` (0.50):
+3. Cosine similarity is computed between the query embedding and each retrieved document's embedding.
+4. Documents are filtered against `SELECTION_THRESHOLD` (0.75) — only documents meeting or exceeding this threshold are considered. The top 4 passing documents are kept (threshold-gated Top-K).
+5. If any documents passed the threshold, the best match routes to Path A. If none passed, the query routes to Path B.
 
 ```
-Query similarity >=  0.50  →  PATH A (Refinement)
-Query similarity <   0.50  →  PATH B (Web Search)
+Any document >= 0.75  →  PATH A (Refinement) using best match
+No document  >= 0.75  →  PATH B (Web Search)
 ```
 
 ---
@@ -371,7 +372,8 @@ All thresholds live in `src/thresholds.json` and are loaded at startup via `conf
 
 | Threshold | Value | Description |
 |---|---|---|
-| `RELEVANCE_THRESHOLD` | 0.50 | Minimum query-to-doc cosine similarity to trigger Path A |
+| `SELECTION_THRESHOLD` | 0.75 | Minimum query-to-doc cosine similarity for a document to be considered a match (single gate for Path A vs Path B routing) |
+| `VOLATILE_CACHE_TTL_SECONDS` | 300 | Time-to-live for cached VOLATILE query responses (prevents redundant Tavily API calls) |
 | `REJECTION_THRESHOLD` | 0.70 | Minimum Critic score for a document to proceed |
 | `PROMOTION_SCORE_THRESHOLD` | 0.80 | Minimum best Critic score across all confirmations for promotion |
 | `PROMOTION_SIMILARITY_THRESHOLD` | 0.80 | Minimum cosine similarity to original for Path A promotion |
@@ -521,7 +523,7 @@ poisoned active doc
 - **Fix:** Replaced `_quarantine_document()` with `_log_unverified_dispute()`. When a dispute cannot be verified by web search, the document's status **remains `"active"`**. The dispute details (session, query, timestamp, reason) are appended to an `unverified_disputes` JSON array in the document's metadata. This implements an **"Innocent Until Proven Guilty"** doctrine.
 - **Problem (Active Pool Duplication):** Path B only checked the candidate pool for duplicates before storing a new candidate. If a query barely missed the relevance threshold and routed to Path B, the web search could return knowledge identical to an existing active document, creating a duplicate.
 - **Fix:** Added **Step B3.4 — Active Pool Deduplication**. Before checking the candidate pool, Path B now queries the active collection. If the synthesized document has cosine similarity ≥ 0.85 with an existing active document, it is discarded entirely.
-- **Changed:** `RELEVANCE_THRESHOLD` raised from `0.40` to `0.50` to reduce false Path A routing (queries that barely match but aren't truly relevant, forcing unnecessary Smart Router LLM calls).
+- **Changed:** `RELEVANCE_THRESHOLD` raised from `0.40` to `0.50` to reduce false Path A routing (queries that barely match but aren't truly relevant, forcing unnecessary Smart Router LLM calls). *(Note: `RELEVANCE_THRESHOLD` was later consolidated into `SELECTION_THRESHOLD` in v1.3.)*
 - **Updated:** The `forensics` CLI command now also scans active documents for the `unverified_disputes` metadata field, displaying them as `ACTIVE (Dispute Logged)` entries.
 
 ### v1.1 — Conflict Agreement Check (False Poisoning Prevention)
@@ -538,3 +540,9 @@ poisoned active doc
 - **Added: `reseed` CLI Command** — Force re-seeds the database with starter documents even when data already exists.
 - **Added: LLM Topic Extraction** — Web candidate promotion now uses `EXTRACT_TOPIC_PROMPT` to generate a clean, canonical topic name from document content instead of using the raw user query as the topic label.
 - **Fixed: Active Pool Dedup Skip** — Path B's active pool deduplication check is now skipped for rerouted queries with a `parent_id` (VOLATILE/INSUFFICIENT). The enriched document would naturally match its parent and be incorrectly discarded as a duplicate.
+
+### v1.3 — Threshold Consolidation & Volatile Cache
+- **Problem (Redundant Gate):** The pipeline had two separate similarity thresholds — `SELECTION_THRESHOLD` (0.75, hardcoded in `run_akm()`) filtered candidates, while `RELEVANCE_THRESHOLD` (0.50, from `thresholds.json`) gated Path A vs Path B routing. Since `SELECTION_THRESHOLD` was stricter, `RELEVANCE_THRESHOLD` was dead code — any document that passed 0.75 already exceeded 0.50, and if nothing passed, `doc_similarity` was set to 0.0.
+- **Fix:** Consolidated both into a single `SELECTION_THRESHOLD` (0.75) in `thresholds.json`. Removed `RELEVANCE_THRESHOLD` entirely. The routing gate now checks `doc_original is None` (i.e., whether any document survived the selection filter) instead of comparing against a numeric threshold.
+- **Problem (API Token Bleed):** When the Smart Router classified a query as `VOLATILE`, it unconditionally triggered `_web_search_path()` → Tavily API. If 1,000 users asked the same volatile question within the same hour, 1,000 redundant external web searches fired. A 2-second-old response was treated identically to a 10-day-old one.
+- **Fix:** Added an in-process TTL cache (`_volatile_cache`) keyed by normalized query string. When a VOLATILE query is about to trigger a web search, the cache is checked first. If a response exists within `VOLATILE_CACHE_TTL_SECONDS` (300s / 5 minutes), it is served directly — skipping the entire Path B pipeline (Tavily search, LLM synthesis, Critic scoring). Expired entries are evicted on each cache check to prevent unbounded memory growth.

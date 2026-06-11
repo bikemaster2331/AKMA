@@ -13,6 +13,7 @@ from telemetry import record_groq_usage, log_telemetry
 from config import (
     GROQ_API_KEY,
     REJECTION_THRESHOLD,
+    SELECTION_THRESHOLD,
     PROMOTION_SCORE_THRESHOLD,
     PROMOTION_SIMILARITY_THRESHOLD,
     PROMOTION_COUNT_THRESHOLD,
@@ -21,7 +22,8 @@ from config import (
     WEB_CANDIDATE_MATCH_THRESHOLD,
     DELTA_MATCH_THRESHOLD,
     IDENTICAL_REFINEMENT_THRESHOLD,
-    RELEVANCE_THRESHOLD,
+    VOLATILE_CACHE_TTL_SECONDS,
+    TOP_K_ACTIVE,
 )
 from prompts import (
     CONFIRM_AND_REFINE_PROMPT,
@@ -31,6 +33,20 @@ from prompts import (
 )
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+
+# ── Volatile Response Cache ────────────────────────────────────────────────────
+# In-process TTL cache for VOLATILE queries to prevent redundant Tavily searches.
+# Key: normalized query string, Value: (timestamp, response_document)
+_volatile_cache: dict[str, tuple[float, str]] = {}
+
+
+def _evict_expired_cache() -> None:
+    """Remove expired entries from the volatile cache."""
+    now = time.time()
+    expired = [k for k, (ts, _) in _volatile_cache.items() if now - ts >= VOLATILE_CACHE_TTL_SECONDS]
+    for k in expired:
+        del _volatile_cache[k]
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -51,9 +67,7 @@ def run_akm(user_query: str, session_id: str) -> tuple:
     print(f"{'='*50}")
 
     # ── Step 1: Retrieve closest active document(s) — threshold-gated Top-K ─
-    TOP_K_ACTIVE = 4
     MAX_FETCH = 10
-    SELECTION_THRESHOLD = 0.75
 
     results = active_collection.query(
         query_texts=[user_query],
@@ -123,7 +137,9 @@ def run_akm(user_query: str, session_id: str) -> tuple:
         doc_similarity = best_sim
 
     # ── Step 2: Route based on relevance ──────────────────────────────────────
-    if doc_similarity < RELEVANCE_THRESHOLD:
+    # Single gate: if no document passed SELECTION_THRESHOLD, doc_similarity is 0.0
+    # and doc_original is None — route straight to web search.
+    if doc_original is None:
         print(f"[AKM] No relevant document found — routing to PATH B (Web Search)")
         full_doc = _web_search_path(user_query, session_id)
     else:
@@ -208,8 +224,28 @@ def _refinement_path(
     
     if routing != "STATIC_MATCH":
         print(f"[AKM] Smart Router classified query as {routing} — rerouting to PATH B (Web Search)")
+
+        # ── Volatile Cache: check before hitting Tavily ─────────────────────
+        if routing == "VOLATILE":
+            _evict_expired_cache()
+            cache_key = user_query.strip().lower()
+            cached = _volatile_cache.get(cache_key)
+            if cached:
+                cached_time, cached_doc = cached
+                age = time.time() - cached_time
+                print(f"[AKM] ♻ VOLATILE CACHE HIT — serving {age:.0f}s old response (TTL: {VOLATILE_CACHE_TTL_SECONDS}s)")
+                return cached_doc
+        # ────────────────────────────────────────────────────────────────────
+
         pass_parent = doc_id if routing in ["VOLATILE", "CONFLICT", "INSUFFICIENT"] else None
-        return _web_search_path(user_query, session_id, parent_id=pass_parent, routing=routing)
+        result = _web_search_path(user_query, session_id, parent_id=pass_parent, routing=routing)
+
+        # ── Volatile Cache: store result for future hits ────────────────────
+        if routing == "VOLATILE" and result:
+            _volatile_cache[user_query.strip().lower()] = (time.time(), result)
+        # ────────────────────────────────────────────────────────────────────
+
+        return result
     
     doc_refined = refined["refined_text"]
     if not doc_refined:

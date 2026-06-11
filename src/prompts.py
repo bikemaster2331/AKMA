@@ -1,15 +1,23 @@
-EXTRACT_CLAIMS_PROMPT = """Read this document and extract the {max_claims_to_check} most specific, 
-verifiable factual claims in it. These should be concrete facts that can be 
-confirmed or denied by searching the web — not vague statements.
+EXTRACT_CLAIMS_PROMPT = """You are a search query generator for an automated fact-checking pipeline. 
+Your ONLY job is to extract the {max_claims_to_check} most important factual claims from the document and convert them into raw, optimized search engine queries.
+
+ABSOLUTE CONSTRAINTS:
+1. NEVER write a full sentence.
+2. NEVER include URLs, links, or file paths.
+3. NEVER include punctuation (no commas, periods, or quotes).
+4. MUST be 2 to 7 words maximum per query.
+5. MUST contain only specific nouns, names, dates, and core keywords.
 
 DOCUMENT:
 {document}
 
-Return ONLY a numbered list of claims. No preamble, no explanation.
-Example format:
-1. Python was created by Guido van Rossum
-2. Python was first released in 1991
-3. Python supports object-oriented programming"""
+OUTPUT FORMAT:
+Return ONLY a numbered list of raw search queries. No introductory text. No explanations.
+
+EXPECTED OUTPUT EXAMPLE:
+1. Python execution speed comparison C Java
+2. Python first public release date 1991
+3. Niklas Heer speed comparison execution times"""
 
 SYNTHESIZE_FROM_SEARCH_PROMPT = """Based on the following web search results, create a comprehensive, factual document answering the query: "{user_query}"
 
@@ -173,9 +181,17 @@ EXTRACT_TOPIC_PROMPT = """What is the main topic of this document in 1-3 words? 
 Document:
 {document}"""
 
-EXTRACT_DELTA_CLAIMS_PROMPT = """Compare these two documents and extract ONLY the new factual claims that appear in the REFINED document but NOT in the ORIGINAL document.
+EXTRACT_DELTA_CLAIMS_PROMPT = """You are a search query generator for an automated fact-checking pipeline.
+Compare the ORIGINAL and REFINED documents. Identify the NEW factual claims added to the REFINED document.
+Convert these NEW claims into raw, optimized search engine queries.
 
-Focus on specific, verifiable facts — names, dates, numbers, events, or causal claims that were ADDED by the refinement. Ignore any facts that already exist in the original, even if they are rephrased.
+ABSOLUTE CONSTRAINTS:
+1. NEVER write a full sentence.
+2. NEVER include URLs, links, or file paths.
+3. NEVER include punctuation (no commas, periods, or quotes).
+4. MUST be 2 to 7 words maximum per query.
+5. MUST contain only specific nouns, names, dates, and core keywords.
+6. IGNORE facts that exist in the ORIGINAL document.
 
 ORIGINAL DOCUMENT:
 {document_original}
@@ -183,12 +199,13 @@ ORIGINAL DOCUMENT:
 REFINED DOCUMENT:
 {document_refined}
 
-If no new verifiable facts were added (only restructuring or rephrasing), return exactly: NONE
+OUTPUT FORMAT:
+If no new verifiable facts exist, return exactly: NONE
+Otherwise, return ONLY a numbered list of raw search queries. No introductory text. No explanations.
 
-Otherwise, return ONLY a numbered list of the new claims. No preamble, no explanation.
-Example format:
-1. Python was designed as a scripting tool for Amoeba OS
-2. Development started at CWI Amsterdam"""
+EXPECTED OUTPUT EXAMPLE:
+1. Python Amoeba OS scripting tool design
+2. Java execution time performance comparisons"""
 
 VERIFY_CLAIM_PROMPT = """A specific factual claim was searched on the web. Your job is to determine whether the search results CONFIRM or DENY this claim.
 
