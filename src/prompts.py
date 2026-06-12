@@ -74,7 +74,7 @@ Rules:
 2. Your job is ONLY to integrate genuinely new information from the user query. If the user provides additional context, details, or expansions that are plausible within the document's framework, add them.
 3. If the user is simply asking a question and not providing new information, reproduce the document as-is.
 4. Tag as 'expansion' if adding new info alongside existing facts.
-
+                                    
 Respond in EXACTLY this format:
 
 <<<ROUTING>>>: STATIC_MATCH | VOLATILE | CONFLICT | DIFFERENT | INSUFFICIENT
